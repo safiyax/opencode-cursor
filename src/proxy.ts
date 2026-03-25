@@ -74,11 +74,15 @@ const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
 const CURSOR_CONNECT_PROTOCOL_VERSION = "1";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
+export const OPENCODE_SESSION_ID_HEADER = "x-opencode-session-id";
+export const OPENCODE_AGENT_HEADER = "x-opencode-agent";
+export const OPENCODE_MESSAGE_ID_HEADER = "x-opencode-message-id";
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
   Connection: "keep-alive",
 } as const;
+const EPHEMERAL_CURSOR_AGENTS = new Set(["title", "summary"]);
 
 interface OpenAIToolCall {
   id: string;
@@ -116,6 +120,12 @@ interface ChatCompletionRequest {
   max_tokens?: number;
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
+}
+
+interface RequestScope {
+  sessionID?: string;
+  agent?: string;
+  messageID?: string;
 }
 
 
@@ -703,7 +713,11 @@ export async function startProxy(
             throw new Error("Cursor proxy access token provider not configured");
           }
           const accessToken = await proxyAccessTokenProvider();
-          return handleChatCompletion(body, accessToken);
+          return handleChatCompletion(body, accessToken, {
+            sessionID: req.headers.get(OPENCODE_SESSION_ID_HEADER) ?? undefined,
+            agent: req.headers.get(OPENCODE_AGENT_HEADER) ?? undefined,
+            messageID: req.headers.get(OPENCODE_MESSAGE_ID_HEADER) ?? undefined,
+          });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logPluginError("Cursor proxy request failed", {
@@ -749,6 +763,7 @@ export function stopProxy(): void {
 function handleChatCompletion(
   body: ChatCompletionRequest,
   accessToken: string,
+  requestScope: RequestScope = {},
 ): Response | Promise<Response> {
   const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
@@ -768,8 +783,8 @@ function handleChatCompletion(
 
   // bridgeKey: model-specific, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages);
-  const convKey = deriveConversationKey(body.messages);
+  const bridgeKey = deriveBridgeKey(modelId, body.messages, requestScope);
+  const convKey = deriveConversationKey(body.messages, requestScope);
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
@@ -796,7 +811,7 @@ function handleChatCompletion(
   let stored = conversationStates.get(convKey);
   if (!stored) {
     stored = {
-      conversationId: deterministicConversationId(convKey),
+      conversationId: crypto.randomUUID(),
       checkpoint: null,
       blobStore: new Map(),
       lastAccessMs: Date.now(),
@@ -1239,6 +1254,12 @@ function handleKvMessage(
     const blobId = kvMsg.message.value.blobId;
     const blobIdKey = Buffer.from(blobId).toString("hex");
     const blobData = blobStore.get(blobIdKey);
+    if (!blobData) {
+      logPluginWarn("Cursor requested missing blob", {
+        blobId: blobIdKey,
+        knownBlobCount: blobStore.size,
+      });
+    }
     sendKvResponse(
       kvMsg, "getBlobResult",
       create(GetBlobResultSchema, blobData ? { blobData } : {}),
@@ -1430,17 +1451,36 @@ function sendExecResult(
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
-function deriveBridgeKey(modelId: string, messages: OpenAIMessage[]): string {
+function deriveBridgeKey(
+  modelId: string,
+  messages: OpenAIMessage[],
+  requestScope: RequestScope,
+): string {
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
-    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
+    .update(
+      `bridge:${requestScope.sessionID ?? ""}:${requestScope.agent ?? ""}:${modelId}:${firstUserText.slice(0, 200)}`,
+    )
     .digest("hex")
     .slice(0, 16);
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches. */
-function deriveConversationKey(messages: OpenAIMessage[]): string {
+function deriveConversationKey(
+  messages: OpenAIMessage[],
+  requestScope: RequestScope,
+): string {
+  if (requestScope.sessionID) {
+    const scope = shouldIsolateConversation(requestScope)
+      ? `${requestScope.sessionID}:${requestScope.agent ?? ""}:${requestScope.messageID ?? crypto.randomUUID()}`
+      : `${requestScope.sessionID}:${requestScope.agent ?? "default"}`;
+    return createHash("sha256")
+      .update(`conv:${scope}`)
+      .digest("hex")
+      .slice(0, 16);
+  }
+
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
   return createHash("sha256")
@@ -1449,21 +1489,12 @@ function deriveConversationKey(messages: OpenAIMessage[]): string {
     .slice(0, 16);
 }
 
-/** Deterministic UUID derived from convKey so Cursor's server-side conversation
- *  persists across proxy restarts. Formats 16 bytes of SHA-256 as a v4-shaped UUID. */
-function deterministicConversationId(convKey: string): string {
-  const hex = createHash("sha256")
-    .update(`cursor-conv-id:${convKey}`)
-    .digest("hex")
-    .slice(0, 32);
-  // Format as UUID: xxxxxxxx-xxxx-4xxx-Nxxx-xxxxxxxxxxxx
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    `4${hex.slice(13, 16)}`,
-    `${(0x8 | (parseInt(hex[16], 16) & 0x3)).toString(16)}${hex.slice(17, 20)}`,
-    hex.slice(20, 32),
-  ].join("-");
+function shouldIsolateConversation(requestScope: RequestScope): boolean {
+  return Boolean(
+    requestScope.agent
+      && EPHEMERAL_CURSOR_AGENTS.has(requestScope.agent)
+      && requestScope.messageID,
+  );
 }
 
 /** Create an SSE streaming Response that reads from a live bridge. */
@@ -1529,6 +1560,7 @@ function createBridgeStreamResponse(
       const tagFilter = createThinkingTagFilter();
 
       let mcpExecReceived = false;
+      let endStreamError: Error | null = null;
 
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
@@ -1600,9 +1632,14 @@ function createBridgeStreamResponse(
           }
         },
         (endStreamBytes) => {
-          const endError = parseConnectEndStream(endStreamBytes);
-          if (endError) {
-            sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+          endStreamError = parseConnectEndStream(endStreamBytes);
+          if (endStreamError) {
+            logPluginError("Cursor stream returned Connect end-stream error", {
+              modelId,
+              bridgeKey,
+              convKey,
+              ...errorDetails(endStreamError),
+            });
           }
         },
       );
@@ -1615,6 +1652,14 @@ function createBridgeStreamResponse(
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
           stored.lastAccessMs = Date.now();
+        }
+        if (endStreamError) {
+          activeBridges.delete(bridgeKey);
+          if (!closed) {
+            closed = true;
+            controller.error(endStreamError);
+          }
+          return;
         }
         if (!mcpExecReceived) {
           const flushed = tagFilter.flush();
@@ -1742,7 +1787,7 @@ async function handleNonStreamingResponse(
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const { text, usage } = await collectFullResponse(payload, accessToken, convKey);
+  const { text, usage } = await collectFullResponse(payload, accessToken, modelId, convKey);
 
   return new Response(
     JSON.stringify({
@@ -1771,10 +1816,12 @@ interface CollectedResponse {
 async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
+  modelId: string,
   convKey: string,
 ): Promise<CollectedResponse> {
-  const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
+  const { promise, resolve, reject } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
+  let endStreamError: Error | null = null;
 
   const { bridge, heartbeatTimer } = await startBridge(accessToken, payload.requestBytes);
 
@@ -1817,7 +1864,16 @@ async function collectFullResponse(
         // Skip
       }
     },
-    () => { },
+    (endStreamBytes) => {
+      endStreamError = parseConnectEndStream(endStreamBytes);
+      if (endStreamError) {
+        logPluginError("Cursor non-streaming response returned Connect end-stream error", {
+          modelId,
+          convKey,
+          ...errorDetails(endStreamError),
+        });
+      }
+    },
   ));
 
   bridge.onClose(() => {
@@ -1829,6 +1885,11 @@ async function collectFullResponse(
     }
     const flushed = tagFilter.flush();
     fullText += flushed.content;
+
+    if (endStreamError) {
+      reject(endStreamError);
+      return;
+    }
 
     const usage = computeUsage(state);
     resolve({
