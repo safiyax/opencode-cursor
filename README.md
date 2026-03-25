@@ -46,24 +46,23 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 1. OAuth — browser-based login to Cursor via PKCE.
 2. Model discovery — queries Cursor's gRPC API for all available models.
 3. Local proxy — translates `POST /v1/chat/completions` into Cursor's
-   protobuf/HTTP/2 Connect protocol.
+   protobuf/Connect protocol.
 4. Native tool routing — rejects Cursor's built-in filesystem/shell tools and
    exposes OpenCode's tool surface via Cursor MCP instead.
 
-HTTP/2 transport runs through a Node child process (`h2-bridge.mjs`) because
-Bun's `node:http2` support is not reliable against Cursor's API.
+Cursor agent streaming uses Cursor's `RunSSE` + `BidiAppend` transport, so the
+plugin runs entirely inside OpenCode without a Node sidecar.
 
 ## Architecture
 
 ```
 OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
                                               |
-                                    Node child process (h2-bridge.mjs)
+                              RunSSE stream + BidiAppend writes
                                               |
-                                     HTTP/2 Connect stream
+                                Cursor Connect/SSE transport
                                               |
-                                    api2.cursor.sh gRPC
-                                      /agent.v1.AgentService/Run
+                                     api2.cursor.sh gRPC
 ```
 
 ### Tool call flow
@@ -73,9 +72,9 @@ OpenCode  -->  /v1/chat/completions  -->  Bun.serve (proxy)
 2. Model tries native tools (readArgs, shellArgs, etc.)
 3. Proxy rejects each with typed error (ReadRejected, ShellRejected, etc.)
 4. Model falls back to MCP tool -> mcpArgs exec message
-5. Proxy emits OpenAI tool_calls SSE chunk, pauses H2 stream
+5. Proxy emits OpenAI tool_calls SSE chunk, pauses the Cursor stream
 6. OpenCode executes tool, sends result in follow-up request
-7. Proxy resumes H2 stream with mcpResult, streams continuation
+7. Proxy resumes the Cursor stream with mcpResult and continues streaming
 ```
 
 ## Develop locally
@@ -86,9 +85,19 @@ bun run build
 bun test/smoke.ts
 ```
 
+## Publish
+
+GitHub Actions publishes this package with `.github/workflows/publish-npm.yml`.
+
+- branch pushes publish a `dev` build as `0.0.0-dev.<sha>`
+- versioned releases publish `latest` using the `package.json` version and upload the packed `.tgz` to the GitHub release
+
+Repository secrets required:
+
+- `NPM_TOKEN` for npm publish access
+
 ## Requirements
 
 - [OpenCode](https://opencode.ai)
 - [Bun](https://bun.sh)
-- [Node.js](https://nodejs.org) >= 18 for the HTTP/2 bridge process
 - Active [Cursor](https://cursor.com) subscription

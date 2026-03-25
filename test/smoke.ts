@@ -1,5 +1,4 @@
 import http from "node:http";
-import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
@@ -104,37 +103,30 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   await new Promise<void>((resolve) => refreshServer.listen(0, "127.0.0.1", resolve));
   const refreshPort = (refreshServer.address() as AddressInfo).port;
 
-  const apiServer = http2.createServer();
-  apiServer.on("stream", (stream, headers) => {
-    const path = String(headers[":path"] ?? "");
-    const authHeader = String(headers.authorization ?? "");
-    if (path === "/agent.v1.AgentService/Run") {
-      stream.respond({
-        ":status": 200,
-        "content-type": "application/connect+proto",
-      });
-      stream.end();
-      return;
-    }
+  let pendingRunSSE: http.ServerResponse | null = null;
 
+  const apiServer = http.createServer((req, res) => {
+    const path = req.url ?? "";
+    const authHeader = req.headers.authorization ?? "";
     const chunks: Buffer[] = [];
 
-    stream.on("data", (chunk) => {
+    req.on("data", (chunk) => {
       chunks.push(Buffer.from(chunk));
     });
-    stream.on("end", () => {
+    req.on("end", () => {
+      if (req.method !== "POST") {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+
       if (path === "/agent.v1.AgentService/GetUsableModels") {
         discoveryAuthHeaders.push(authHeader);
         discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
 
         if (discoveryMode === "auth-error") {
-          stream.respond({
-            ":status": 401,
-            "content-type": "application/json",
-          });
-          stream.end(
-            JSON.stringify({ code: "unauthenticated", message: "expired token" }),
-          );
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ code: "unauthenticated", message: "expired token" }));
           return;
         }
 
@@ -156,16 +148,34 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
                 }),
               ),
             );
-        stream.respond({
-          ":status": 200,
-          "content-type": "application/connect+proto",
-        });
-        stream.end(responseBody);
+        res.writeHead(200, { "Content-Type": "application/connect+proto" });
+        res.end(responseBody);
         return;
       }
 
-      stream.respond({ ":status": 404 });
-      stream.end();
+      if (path === "/agent.v1.AgentService/RunSSE") {
+        pendingRunSSE = res;
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        res.flushHeaders();
+        return;
+      }
+
+      if (path === "/aiserver.v1.BidiService/BidiAppend") {
+        res.writeHead(200, { "Content-Type": "application/proto" });
+        res.end();
+        if (pendingRunSSE) {
+          pendingRunSSE.end();
+          pendingRunSSE = null;
+        }
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
     });
   });
   await new Promise<void>((resolve) => apiServer.listen(0, "127.0.0.1", resolve));

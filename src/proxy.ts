@@ -2,7 +2,7 @@
  * Local OpenAI-compatible proxy that translates requests to Cursor's gRPC protocol.
  *
  * Accepts POST /v1/chat/completions in OpenAI format, translates to Cursor's
- * protobuf/HTTP2 Connect protocol, and streams back OpenAI-format SSE.
+ * protobuf/Connect protocol, and streams back OpenAI-format SSE.
  *
  * Tool calling uses Cursor's native MCP tool protocol:
  * - OpenAI tool defs → McpToolDefinition in RequestContext
@@ -10,8 +10,7 @@
  * - mcpArgs exec → pause stream, return tool_calls to caller
  * - Follow-up request with tool results → resume bridge with mcpResult
  *
- * HTTP/2 transport is delegated to a Node child process (h2-bridge.mjs)
- * because Bun's node:http2 module is broken.
+ * Cursor agent streaming runs via RunSSE + BidiAppend, avoiding any Node sidecar.
  */
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
@@ -19,6 +18,7 @@ import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   AgentServerMessageSchema,
+  BidiRequestIdSchema,
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
@@ -67,11 +67,10 @@ import {
   type McpToolDefinition,
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
-import { resolve as pathResolve } from "node:path";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
+const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
-const BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge.mjs");
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -133,9 +132,9 @@ interface PendingExec {
   decodedArgs: string;
 }
 
-/** A bridge kept alive across requests for tool result continuation. */
+/** A live Cursor session kept alive across requests for tool result continuation. */
 interface ActiveBridge {
-  bridge: ReturnType<typeof spawnBridge>;
+  bridge: CursorSession;
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
@@ -166,14 +165,6 @@ function evictStaleConversations(): void {
   }
 }
 
-/** Length-prefix a message: [4-byte BE length][payload] */
-function lpEncode(data: Uint8Array): Buffer {
-  const buf = Buffer.alloc(4 + data.length);
-  buf.writeUInt32BE(data.length, 0);
-  buf.set(data, 4);
-  return buf;
-}
-
 /** Connect protocol frame: [1-byte flags][4-byte BE length][payload] */
 function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
   const frame = Buffer.alloc(5 + data.length);
@@ -183,95 +174,249 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
   return frame;
 }
 
-/**
- * Spawn the Node H2 bridge and return read/write handles.
- * The bridge uses length-prefixed framing on stdin/stdout.
- */
-interface SpawnBridgeOptions {
+interface CursorBaseRequestOptions {
   accessToken: string;
-  rpcPath: string;
   url?: string;
-  /** When true, use application/proto for unary RPCs instead of Connect streaming. */
-  unary?: boolean;
 }
 
-function spawnBridge(options: SpawnBridgeOptions): {
-  proc: ReturnType<typeof Bun.spawn>;
+function buildCursorHeaders(
+  options: CursorBaseRequestOptions,
+  contentType: string,
+  extra: Record<string, string> = {},
+): Headers {
+  const headers = new Headers({
+    authorization: `Bearer ${options.accessToken}`,
+    "content-type": contentType,
+    "x-ghost-mode": "true",
+    "x-cursor-client-version": CURSOR_CLIENT_VERSION,
+    "x-cursor-client-type": "cli",
+    "x-request-id": crypto.randomUUID(),
+  });
+
+  for (const [key, value] of Object.entries(extra)) {
+    headers.set(key, value);
+  }
+
+  return headers;
+}
+
+function encodeVarint(value: number): Uint8Array {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Unsupported varint value: ${value}`);
+  }
+
+  const bytes: number[] = [];
+  let current = value;
+  while (current >= 0x80) {
+    bytes.push((current & 0x7f) | 0x80);
+    current = Math.floor(current / 128);
+  }
+  bytes.push(current);
+  return Uint8Array.from(bytes);
+}
+
+function encodeProtoField(tag: number, wireType: number, value: Uint8Array): Uint8Array {
+  const key = encodeVarint((tag << 3) | wireType);
+  const out = new Uint8Array(key.length + value.length);
+  out.set(key, 0);
+  out.set(value, key.length);
+  return out;
+}
+
+function encodeProtoStringField(tag: number, value: string): Uint8Array {
+  const bytes = new TextEncoder().encode(value);
+  const len = encodeVarint(bytes.length);
+  const payload = new Uint8Array(len.length + bytes.length);
+  payload.set(len, 0);
+  payload.set(bytes, len.length);
+  return encodeProtoField(tag, 2, payload);
+}
+
+function encodeProtoMessageField(tag: number, value: Uint8Array): Uint8Array {
+  const len = encodeVarint(value.length);
+  const payload = new Uint8Array(len.length + value.length);
+  payload.set(len, 0);
+  payload.set(value, len.length);
+  return encodeProtoField(tag, 2, payload);
+}
+
+function encodeProtoVarintField(tag: number, value: number): Uint8Array {
+  return encodeProtoField(tag, 0, encodeVarint(value));
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function toFetchBody(data: Uint8Array): ArrayBuffer {
+  return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+}
+
+function encodeBidiAppendRequest(
+  dataHex: string,
+  requestId: string,
+  appendSeqno: number,
+): Uint8Array {
+  const requestIdBytes = toBinary(
+    BidiRequestIdSchema,
+    create(BidiRequestIdSchema, { requestId }),
+  );
+  return concatBytes([
+    encodeProtoStringField(1, dataHex),
+    encodeProtoMessageField(2, requestIdBytes),
+    encodeProtoVarintField(3, appendSeqno),
+  ]);
+}
+
+interface CursorSession {
   write: (data: Uint8Array) => void;
   end: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
-  /** True while the bridge subprocess is still running. */
-  get alive(): boolean;
-} {
-  const proc = Bun.spawn(["node", BRIDGE_PATH], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "ignore",
-  });
+  readonly alive: boolean;
+}
 
-  const config = JSON.stringify({
-    accessToken: options.accessToken,
-    url: options.url ?? CURSOR_API_URL,
-    path: options.rpcPath,
-    unary: options.unary ?? false,
-  });
-  proc.stdin.write(lpEncode(new TextEncoder().encode(config)));
+interface CreateCursorSessionOptions extends CursorBaseRequestOptions {
+  requestId: string;
+}
+
+async function createCursorSession(
+  options: CreateCursorSessionOptions,
+): Promise<CursorSession> {
+  const response = await fetch(
+    new URL("/agent.v1.AgentService/RunSSE", options.url ?? CURSOR_API_URL),
+    {
+      method: "POST",
+      headers: buildCursorHeaders(options, "application/connect+proto", {
+        accept: "text/event-stream",
+        "connect-protocol-version": "1",
+      }),
+      body: toFetchBody(frameConnectMessage(
+        toBinary(
+          BidiRequestIdSchema,
+          create(BidiRequestIdSchema, { requestId: options.requestId }),
+        ),
+      )),
+    },
+  );
+
+  if (!response.ok || !response.body) {
+    const errorBody = await response.text().catch(() => "");
+    throw new Error(
+      `RunSSE failed: ${response.status}${errorBody ? ` ${errorBody}` : ""}`,
+    );
+  }
 
   const cbs = {
     data: null as ((chunk: Buffer) => void) | null,
     close: null as ((code: number) => void) | null,
   };
+  const abortController = new AbortController();
+  const reader = response.body.getReader();
+  let appendSeqno = 0;
+  let alive = true;
+  let closeCode = 0;
+  let writeChain = Promise.resolve();
+  const pendingChunks: Buffer[] = [];
 
-  // Track exit state so late onClose registrations fire immediately.
-  let exited = false;
-  let exitCode = 1;
+  const finish = (code: number) => {
+    if (!alive) return;
+    alive = false;
+    closeCode = code;
+    cbs.close?.(code);
+  };
+
+  const append = async (data: Uint8Array) => {
+    const requestBody = encodeBidiAppendRequest(
+      Buffer.from(data).toString("hex"),
+      options.requestId,
+      appendSeqno++,
+    );
+    const appendResponse = await fetch(
+      new URL("/aiserver.v1.BidiService/BidiAppend", options.url ?? CURSOR_API_URL),
+      {
+        method: "POST",
+        headers: buildCursorHeaders(options, "application/proto"),
+        body: toFetchBody(requestBody),
+        signal: abortController.signal,
+      },
+    );
+
+    if (!appendResponse.ok) {
+      const errorBody = await appendResponse.text().catch(() => "");
+      throw new Error(
+        `BidiAppend failed: ${appendResponse.status}${errorBody ? ` ${errorBody}` : ""}`,
+      );
+    }
+
+    await appendResponse.arrayBuffer().catch(() => undefined);
+  };
 
   (async () => {
-    const reader = proc.stdout.getReader();
-    let pending = Buffer.alloc(0);
-
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-        pending = Buffer.concat([pending, Buffer.from(value)]);
-
-        while (pending.length >= 4) {
-          const len = pending.readUInt32BE(0);
-          if (pending.length < 4 + len) break;
-          const payload = pending.subarray(4, 4 + len);
-          pending = pending.subarray(4 + len);
-          cbs.data?.(Buffer.from(payload));
+        if (done) {
+          finish(0);
+          break;
+        }
+        if (value && value.length > 0) {
+          const chunk = Buffer.from(value);
+          if (cbs.data) {
+            cbs.data(chunk);
+          } else {
+            pendingChunks.push(chunk);
+          }
         }
       }
     } catch {
-      // Stream ended
+      finish(alive ? 1 : closeCode);
     }
-
-    const code = await proc.exited ?? 1;
-    exited = true;
-    exitCode = code;
-    cbs.close?.(code);
   })();
 
   return {
-    proc,
-    get alive() { return !exited; },
+    get alive() {
+      return alive;
+    },
     write(data) {
-      try { proc.stdin.write(lpEncode(data)); } catch {}
+      if (!alive) return;
+      writeChain = writeChain
+        .then(() => append(data))
+        .catch(() => {
+          try {
+            abortController.abort();
+          } catch {}
+          try {
+            reader.cancel();
+          } catch {}
+          finish(1);
+        });
     },
     end() {
       try {
-        proc.stdin.write(lpEncode(new Uint8Array(0)));
-        proc.stdin.end();
+        abortController.abort();
       } catch {}
+      try {
+        reader.cancel();
+      } catch {}
+      finish(0);
     },
-    onData(cb) { cbs.data = cb; },
+    onData(cb) {
+      cbs.data = cb;
+      while (pendingChunks.length > 0) {
+        cb(pendingChunks.shift()!);
+      }
+    },
     onClose(cb) {
-      if (exited) {
-        // Process already exited — invoke immediately so streams don't hang.
-        queueMicrotask(() => cb(exitCode));
+      if (!alive) {
+        queueMicrotask(() => cb(closeCode));
       } else {
         cbs.close = cb;
       }
@@ -290,44 +435,42 @@ interface CursorUnaryRpcOptions {
 export async function callCursorUnaryRpc(
   options: CursorUnaryRpcOptions,
  ): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
-  const bridge = spawnBridge({
-    accessToken: options.accessToken,
-    rpcPath: options.rpcPath,
-    url: options.url,
-    unary: true,
-  });
-  const chunks: Buffer[] = [];
-  const { promise, resolve } = Promise.withResolvers<{
-    body: Uint8Array;
-    exitCode: number;
-    timedOut: boolean;
-  }>();
   let timedOut = false;
   const timeoutMs = options.timeoutMs ?? 5_000;
+  const controller = new AbortController();
   const timeout = timeoutMs > 0
     ? setTimeout(() => {
         timedOut = true;
-        try { bridge.proc.kill(); } catch {}
+        controller.abort();
       }, timeoutMs)
     : undefined;
 
-  bridge.onData((chunk) => {
-    chunks.push(Buffer.from(chunk));
-  });
-  bridge.onClose((exitCode) => {
-    if (timeout) clearTimeout(timeout);
-    resolve({
-      body: Buffer.concat(chunks),
-      exitCode,
+  try {
+    const response = await fetch(
+      new URL(options.rpcPath, options.url ?? CURSOR_API_URL),
+      {
+        method: "POST",
+        headers: buildCursorHeaders(options, "application/proto"),
+        body: toFetchBody(options.requestBody),
+        signal: controller.signal,
+      },
+    );
+
+    const body = new Uint8Array(await response.arrayBuffer());
+    return {
+      body,
+      exitCode: response.ok ? 0 : response.status,
       timedOut,
-    });
-  });
-
-  // Unary: send raw protobuf body (no Connect framing)
-  bridge.write(options.requestBody);
-  bridge.end();
-
-  return promise;
+    };
+  } catch {
+    return {
+      body: new Uint8Array(),
+      exitCode: timedOut ? 124 : 1,
+      timedOut,
+    };
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 let proxyServer: ReturnType<typeof Bun.serve> | undefined;
@@ -736,7 +879,7 @@ function makeHeartbeatBytes(): Uint8Array {
       value: create(ClientHeartbeatSchema, {}),
     },
   });
-  return frameConnectMessage(toBinary(AgentClientMessageSchema, heartbeat));
+  return toBinary(AgentClientMessageSchema, heartbeat);
 }
 
 /**
@@ -904,7 +1047,7 @@ function sendKvResponse(
   const clientMsg = create(AgentClientMessageSchema, {
     message: { case: "kvClientMessage", value: response },
   });
-  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMsg)));
+  sendFrame(toBinary(AgentClientMessageSchema, clientMsg));
 }
 
 function handleKvMessage(
@@ -1105,7 +1248,7 @@ function sendExecResult(
   const clientMessage = create(AgentClientMessageSchema, {
     message: { case: "execClientMessage", value: execClientMessage },
   });
-  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+  sendFrame(toBinary(AgentClientMessageSchema, clientMessage));
 }
 
 /** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
@@ -1147,7 +1290,7 @@ function deterministicConversationId(convKey: string): string {
 
 /** Create an SSE streaming Response that reads from a live bridge. */
 function createBridgeStreamResponse(
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: CursorSession,
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
@@ -1321,28 +1464,29 @@ function createBridgeStreamResponse(
   return new Response(stream, { headers: SSE_HEADERS });
 }
 
-/** Spawn a bridge, send the initial request frame, and start heartbeat. */
-function startBridge(
+/** Start a Cursor RunSSE session, send the initial request, and start heartbeats. */
+async function startBridge(
   accessToken: string,
   requestBytes: Uint8Array,
-): { bridge: ReturnType<typeof spawnBridge>; heartbeatTimer: NodeJS.Timeout } {
-  const bridge = spawnBridge({
+): Promise<{ bridge: CursorSession; heartbeatTimer: NodeJS.Timeout }> {
+  const requestId = crypto.randomUUID();
+  const bridge = await createCursorSession({
     accessToken,
-    rpcPath: "/agent.v1.AgentService/Run",
+    requestId,
   });
-  bridge.write(frameConnectMessage(requestBytes));
+  bridge.write(requestBytes);
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
   return { bridge, heartbeatTimer };
 }
 
-function handleStreamingResponse(
+async function handleStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
   bridgeKey: string,
   convKey: string,
-): Response {
-  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
+): Promise<Response> {
+  const { bridge, heartbeatTimer } = await startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
@@ -1402,9 +1546,7 @@ function handleToolResultResume(
       message: { case: "execClientMessage", value: execClientMessage },
     });
 
-    bridge.write(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
-    );
+    bridge.write(toBinary(AgentClientMessageSchema, clientMessage));
   }
 
   return createBridgeStreamResponse(
@@ -1456,7 +1598,7 @@ async function collectFullResponse(
   const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
 
-  const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
+  const { bridge, heartbeatTimer } = await startBridge(accessToken, payload.requestBytes);
 
   const state: StreamState = {
     toolCallIndex: 0,
