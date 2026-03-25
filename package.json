@@ -18,17 +18,17 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-runtime.mjs",
+    "build": "tsc -p tsconfig.json",
     "test": "bun test/smoke.ts",
     "prepublishOnly": "npm run build"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ephraimduncan/opencode-cursor.git"
+    "url": "git+https://github.com/PoolPirate/opencode-cursor.git"
   },
-  "homepage": "https://github.com/ephraimduncan/opencode-cursor#readme",
+  "homepage": "https://github.com/PoolPirate/opencode-cursor#readme",
   "bugs": {
-    "url": "https://github.com/ephraimduncan/opencode-cursor/issues"
+    "url": "https://github.com/PoolPirate/opencode-cursor/issues"
   },
   "keywords": [
     "opencode",
@@ -37,9 +37,6 @@
     "oauth",
     "openai-compatible"
   ],
-  "engines": {
-    "node": ">=18"
-  },
   "publishConfig": {
     "access": "public"
   },
