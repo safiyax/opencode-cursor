@@ -68,6 +68,7 @@ import {
 } from "./proto/agent_pb";
 import { createHash } from "node:crypto";
 import { connect as connectHttp2, type ClientHttp2Session, type ClientHttp2Stream, type IncomingHttpHeaders, type OutgoingHttpHeaders } from "node:http2";
+import { errorDetails, logPluginError, logPluginWarn } from "./logger";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
@@ -316,6 +317,11 @@ async function createCursorSession(
 
   if (!response.ok || !response.body) {
     const errorBody = await response.text().catch(() => "");
+    logPluginError("Cursor RunSSE request failed", {
+      requestId: options.requestId,
+      status: response.status,
+      responseBody: errorBody,
+    });
     throw new Error(
       `RunSSE failed: ${response.status}${errorBody ? ` ${errorBody}` : ""}`,
     );
@@ -358,6 +364,12 @@ async function createCursorSession(
 
     if (!appendResponse.ok) {
       const errorBody = await appendResponse.text().catch(() => "");
+      logPluginError("Cursor BidiAppend request failed", {
+        requestId: options.requestId,
+        appendSeqno: appendSeqno - 1,
+        status: appendResponse.status,
+        responseBody: errorBody,
+      });
       throw new Error(
         `BidiAppend failed: ${appendResponse.status}${errorBody ? ` ${errorBody}` : ""}`,
       );
@@ -383,7 +395,11 @@ async function createCursorSession(
           }
         }
       }
-    } catch {
+    } catch (error) {
+      logPluginWarn("Cursor stream reader closed with error", {
+        requestId: options.requestId,
+        ...errorDetails(error),
+      });
       finish(alive ? 1 : closeCode);
     }
   })();
@@ -396,7 +412,11 @@ async function createCursorSession(
       if (!alive) return;
       writeChain = writeChain
         .then(() => append(data))
-        .catch(() => {
+        .catch((error) => {
+          logPluginError("Cursor stream append failed", {
+            requestId: options.requestId,
+            ...errorDetails(error),
+          });
           try {
             abortController.abort();
           } catch {}
@@ -489,6 +509,12 @@ async function callCursorUnaryRpcOverFetch(
       timedOut,
     };
   } catch {
+    logPluginError("Cursor unary fetch transport failed", {
+      rpcPath: options.rpcPath,
+      url: target.toString(),
+      timeoutMs,
+      timedOut,
+    });
     return {
       body: new Uint8Array(),
       exitCode: timedOut ? 124 : 1,
@@ -538,7 +564,13 @@ async function callCursorUnaryRpcOverHttp2(
 
     try {
       session = connectHttp2(authority);
-      session.once("error", () => {
+      session.once("error", (error) => {
+        logPluginError("Cursor unary HTTP/2 session failed", {
+          rpcPath: options.rpcPath,
+          url: target.toString(),
+          timedOut,
+          ...errorDetails(error),
+        });
         finish({
           body: new Uint8Array(),
           exitCode: timedOut ? 124 : 1,
@@ -578,7 +610,13 @@ async function callCursorUnaryRpcOverHttp2(
           timedOut,
         });
       });
-      stream.once("error", () => {
+      stream.once("error", (error) => {
+        logPluginError("Cursor unary HTTP/2 stream failed", {
+          rpcPath: options.rpcPath,
+          url: target.toString(),
+          timedOut,
+          ...errorDetails(error),
+        });
         finish({
           body: new Uint8Array(),
           exitCode: timedOut ? 124 : 1,
@@ -586,7 +624,13 @@ async function callCursorUnaryRpcOverHttp2(
         });
       });
       stream.end(Buffer.from(options.requestBody));
-    } catch {
+    } catch (error) {
+      logPluginError("Cursor unary HTTP/2 setup failed", {
+        rpcPath: options.rpcPath,
+        url: target.toString(),
+        timedOut,
+        ...errorDetails(error),
+      });
       finish({
         body: new Uint8Array(),
         exitCode: timedOut ? 124 : 1,
@@ -656,6 +700,11 @@ export async function startProxy(
           return handleChatCompletion(body, accessToken);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          logPluginError("Cursor proxy request failed", {
+            path: url.pathname,
+            method: req.method,
+            ...errorDetails(err),
+          });
           return new Response(
             JSON.stringify({
               error: { message, type: "server_error", code: "internal_error" },

@@ -14,6 +14,9 @@ interface TestModules {
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   callCursorUnaryRpc: typeof import("../src/proxy").callCursorUnaryRpc;
+  configurePluginLogger: typeof import("../src/logger").configurePluginLogger;
+  logPluginError: typeof import("../src/logger").logPluginError;
+  flushPluginLogs: typeof import("../src/logger").flushPluginLogs;
   generateCursorAuthParams: typeof import("../src/auth").generateCursorAuthParams;
   getTokenExpiry: typeof import("../src/auth").getTokenExpiry;
   CursorAuthPlugin: typeof import("../src/index").CursorAuthPlugin;
@@ -223,18 +226,63 @@ async function loadModules(): Promise<TestModules> {
   const proxy = await import("../src/proxy");
   const auth = await import("../src/auth");
   const index = await import("../src/index");
+  const logger = await import("../src/logger");
   const models = await import("../src/models");
   return {
     startProxy: proxy.startProxy,
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
     callCursorUnaryRpc: proxy.callCursorUnaryRpc,
+    configurePluginLogger: logger.configurePluginLogger,
+    logPluginError: logger.logPluginError,
+    flushPluginLogs: logger.flushPluginLogs,
     generateCursorAuthParams: auth.generateCursorAuthParams,
     getTokenExpiry: auth.getTokenExpiry,
     CursorAuthPlugin: index.CursorAuthPlugin,
     getCursorModels: models.getCursorModels,
     clearModelCache: models.clearModelCache,
   };
+}
+
+async function testPluginLogging(modules: TestModules) {
+  console.log("[test] Testing OpenCode log forwarding...");
+
+  const logEntries: any[] = [];
+  modules.configurePluginLogger({
+    directory: "/tmp/opencode-cursor-logger-test",
+    client: {
+      app: {
+        log: async (entry: any) => {
+          logEntries.push(entry);
+          return true;
+        },
+      },
+    },
+  } as any);
+
+  modules.logPluginError("Logger smoke test", {
+    stage: "smoke",
+    responseBody: new Uint8Array([65, 66]),
+    nested: { ok: true },
+  });
+  await modules.flushPluginLogs();
+
+  assertEqual(logEntries.length, 1, "Expected one forwarded OpenCode log entry");
+  assertEqual(logEntries[0]?.body?.service, "opencode-cursor-oauth", "Expected plugin log service name");
+  assertEqual(logEntries[0]?.body?.level, "error", "Expected error log level");
+  assertEqual(logEntries[0]?.body?.message, "Logger smoke test", "Expected forwarded log message");
+  assertEqual(
+    logEntries[0]?.query?.directory,
+    "/tmp/opencode-cursor-logger-test",
+    "Expected logger to use the configured OpenCode directory",
+  );
+  assertEqual(
+    logEntries[0]?.body?.extra?.responseBody?.type,
+    "uint8array",
+    "Expected binary payloads to be serialized for logging",
+  );
+
+  console.log("[test] OpenCode log forwarding OK");
 }
 
 async function testHttp2UnaryRpc(modules: TestModules) {
@@ -658,6 +706,7 @@ async function main() {
     await testAuthParams(modules);
     await testTokenExpiry(modules);
     await testPluginShape(modules);
+    await testPluginLogging(modules);
     await testHttp2UnaryRpc(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);

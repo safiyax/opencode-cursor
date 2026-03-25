@@ -1,4 +1,5 @@
 import { generatePKCE } from "./pkce";
+import { errorDetails, logPluginError, logPluginWarn } from "./logger";
 
 const CURSOR_LOGIN_URL = "https://cursor.com/loginDeepControl";
 const CURSOR_POLL_URL = "https://api2.cursor.sh/auth/poll";
@@ -73,16 +74,36 @@ export async function pollCursorAuth(
       }
 
       throw new Error(`Poll failed: ${response.status}`);
-    } catch {
+    } catch (error) {
       consecutiveErrors++;
       if (consecutiveErrors >= 3) {
+        logPluginError("Cursor auth polling failed repeatedly", {
+          stage: "oauth_poll",
+          uuid,
+          attempts: attempt + 1,
+          consecutiveErrors,
+          ...errorDetails(error),
+        });
         throw new Error(
           "Too many consecutive errors during Cursor auth polling",
         );
       }
+
+      logPluginWarn("Cursor auth polling attempt failed", {
+        stage: "oauth_poll",
+        uuid,
+        attempt: attempt + 1,
+        consecutiveErrors,
+        ...errorDetails(error),
+      });
     }
   }
 
+  logPluginError("Cursor authentication polling timed out", {
+    stage: "oauth_poll",
+    uuid,
+    attempts: POLL_MAX_ATTEMPTS,
+  });
   throw new Error("Cursor authentication polling timeout");
 }
 
@@ -100,6 +121,11 @@ export async function refreshCursorToken(
 
   if (!response.ok) {
     const error = await response.text();
+    logPluginError("Cursor token refresh failed", {
+      stage: "token_refresh",
+      status: response.status,
+      responseBody: error,
+    });
     throw new Error(`Cursor token refresh failed: ${error}`);
   }
 

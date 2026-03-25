@@ -1,5 +1,6 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
+import { errorDetails, logPluginError, logPluginWarn } from "./logger";
 import { callCursorUnaryRpc } from "./proxy";
 import {
   GetUsableModelsRequestSchema,
@@ -61,18 +62,30 @@ async function fetchCursorUsableModels(
     });
 
     if (response.timedOut) {
+      logPluginError("Cursor model discovery timed out", {
+        rpcPath: GET_USABLE_MODELS_PATH,
+        timeoutMs: MODEL_DISCOVERY_TIMEOUT_MS,
+      });
       throw new CursorModelDiscoveryError(
         `Cursor model discovery timed out after ${MODEL_DISCOVERY_TIMEOUT_MS}ms.`,
       );
     }
 
     if (response.exitCode !== 0) {
+      logPluginError("Cursor model discovery HTTP failure", {
+        rpcPath: GET_USABLE_MODELS_PATH,
+        exitCode: response.exitCode,
+        responseBody: response.body,
+      });
       throw new CursorModelDiscoveryError(
         buildDiscoveryHttpError(response.exitCode, response.body),
       );
     }
 
     if (response.body.length === 0) {
+      logPluginWarn("Cursor model discovery returned an empty response", {
+        rpcPath: GET_USABLE_MODELS_PATH,
+      });
       throw new CursorModelDiscoveryError(
         "Cursor model discovery returned an empty response.",
       );
@@ -80,6 +93,10 @@ async function fetchCursorUsableModels(
 
     const decoded = decodeGetUsableModelsResponse(response.body);
     if (!decoded) {
+      logPluginError("Cursor model discovery returned an unreadable response", {
+        rpcPath: GET_USABLE_MODELS_PATH,
+        responseBody: response.body,
+      });
       throw new CursorModelDiscoveryError(
         "Cursor model discovery returned an unreadable response.",
       );
@@ -95,6 +112,10 @@ async function fetchCursorUsableModels(
     return models;
   } catch (error) {
     if (error instanceof CursorModelDiscoveryError) throw error;
+    logPluginError("Cursor model discovery crashed", {
+      rpcPath: GET_USABLE_MODELS_PATH,
+      ...errorDetails(error),
+    });
     throw new CursorModelDiscoveryError("Cursor model discovery failed.");
   }
 }
