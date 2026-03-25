@@ -440,8 +440,10 @@ async function testExpiredTokenRefreshBeforeDiscovery(
     },
   } as any);
   const provider = { models: {} as Record<string, unknown> } as any;
+  const loader = hooks.auth?.loader;
+  assert(loader, "Expected auth loader to be defined");
 
-  await hooks.auth!.loader(async () => authState, provider);
+  await loader(async () => authState, provider);
 
   assertEqual(writes.length, 1, "Expected refreshed auth to be persisted once");
   assert(
@@ -467,11 +469,11 @@ async function testExpiredTokenRefreshBeforeDiscovery(
   console.log("[test] Refresh-before-discovery OK");
 }
 
-async function testDiscoveryFallbackAndSuccess(
+async function testDiscoveryFailureAndSuccess(
   modules: TestModules,
   backend: TestCursorBackend,
 ) {
-  console.log("[test] Testing discovery fallback and success...");
+  console.log("[test] Testing discovery failure visibility and success...");
 
   const authState = {
     type: "oauth" as const,
@@ -487,25 +489,30 @@ async function testDiscoveryFallbackAndSuccess(
     },
   } as any);
   const provider = { models: { stale: { id: "stale" } } } as any;
+  const loader = hooks.auth?.loader;
+  assert(loader, "Expected auth loader to be defined");
 
-  // Failed discovery should fall back to hardcoded models
+  // Failed discovery should throw instead of falling back to hardcoded models.
   modules.clearModelCache();
   backend.setDiscoveryMode("empty");
-  const degradedConfig = await hooks.auth!.loader(async () => authState, provider);
+  let discoveryError: unknown;
+  try {
+    await loader(async () => authState, provider);
+  } catch (error) {
+    discoveryError = error;
+  }
   assert(
-    Object.keys(provider.models).length > 0,
-    "Expected fallback models to be registered when discovery fails",
+    discoveryError instanceof Error,
+    "Expected loader to throw when discovery fails",
   );
   assert(
-    !("stale" in provider.models),
-    "Expected stale models to be replaced",
+    discoveryError.message.includes("Cursor model discovery returned"),
+    `Expected discovery failure message to be visible, got ${String(discoveryError)}`,
   );
-  const degradedModelsRes = await fetch(`${degradedConfig.baseURL}/models`);
-  assertEqual(degradedModelsRes.status, 200, "Expected degraded /v1/models to succeed");
-  const degradedModelsBody = await degradedModelsRes.json();
-  assert(
-    degradedModelsBody.data.length > 0,
-    "Expected proxy /v1/models to expose fallback models",
+  assertArrayEqual(
+    Object.keys(provider.models),
+    ["stale"],
+    "Expected failed discovery to leave provider models unchanged",
   );
 
   // Successful discovery should replace with real models
@@ -515,7 +522,7 @@ async function testDiscoveryFallbackAndSuccess(
     { id: "real-model-a", name: "Real Model A" },
     { id: "real-model-b", name: "Real Model B", reasoning: true },
   ]);
-  const discoveredConfig = await hooks.auth!.loader(async () => authState, provider);
+  const discoveredConfig = await loader(async () => authState, provider);
   assertArrayEqual(
     Object.keys(provider.models).sort(),
     ["real-model-a", "real-model-b"],
@@ -531,7 +538,7 @@ async function testDiscoveryFallbackAndSuccess(
   );
 
   modules.stopProxy();
-  console.log("[test] Discovery fallback and success OK");
+  console.log("[test] Discovery failure visibility and success OK");
 }
 
 async function main() {
@@ -548,7 +555,7 @@ async function main() {
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
-    await testDiscoveryFallbackAndSuccess(modules, backend);
+    await testDiscoveryFailureAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");
     process.exitCode = 0;
   } catch (err) {

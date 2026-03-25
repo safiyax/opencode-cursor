@@ -1,7 +1,7 @@
 /**
  * Cursor model discovery via GetUsableModels.
- * Uses the H2 bridge for transport. Falls back to a hardcoded list
- * when discovery fails.
+ * Uses the H2 bridge for transport and fails loudly when discovery
+ * does not return usable models.
  */
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
@@ -12,6 +12,7 @@ import {
 } from "./proto/agent_pb";
 
 const GET_USABLE_MODELS_PATH = "/agent.v1.AgentService/GetUsableModels";
+const MODEL_DISCOVERY_TIMEOUT_MS = 5_000;
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 64_000;
@@ -43,28 +44,16 @@ export interface CursorModel {
   maxTokens: number;
 }
 
-const FALLBACK_MODELS: CursorModel[] = [
-  // Composer models
-  { id: "composer-1", name: "Composer 1", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "composer-1.5", name: "Composer 1.5", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  // Claude models
-  { id: "claude-4.6-opus-high", name: "Claude 4.6 Opus", reasoning: true, contextWindow: 200_000, maxTokens: 128_000 },
-  { id: "claude-4.6-sonnet-medium", name: "Claude 4.6 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  { id: "claude-4.5-sonnet", name: "Claude 4.5 Sonnet", reasoning: true, contextWindow: 200_000, maxTokens: 64_000 },
-  // GPT models
-  { id: "gpt-5.4-medium", name: "GPT-5.4", reasoning: true, contextWindow: 272_000, maxTokens: 128_000 },
-  { id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-  { id: "gpt-5.3-codex-spark-preview", name: "GPT-5.3 Codex Spark", reasoning: true, contextWindow: 128_000, maxTokens: 128_000 },
-  // Other models
-  { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
-  { id: "grok-code-fast-1", name: "Grok Code Fast 1", reasoning: false, contextWindow: 128_000, maxTokens: 64_000 },
-];
+export class CursorModelDiscoveryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CursorModelDiscoveryError";
+  }
+}
 
 async function fetchCursorUsableModels(
   apiKey: string,
-): Promise<CursorModel[] | null> {
+): Promise<CursorModel[]> {
   try {
     const requestPayload = create(GetUsableModelsRequestSchema, {});
     const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
@@ -73,19 +62,45 @@ async function fetchCursorUsableModels(
       accessToken: apiKey,
       rpcPath: GET_USABLE_MODELS_PATH,
       requestBody,
+      timeoutMs: MODEL_DISCOVERY_TIMEOUT_MS,
     });
 
-    if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
-      return null;
+    if (response.timedOut) {
+      throw new CursorModelDiscoveryError(
+        `Cursor model discovery timed out after ${MODEL_DISCOVERY_TIMEOUT_MS}ms.`,
+      );
+    }
+
+    if (response.exitCode !== 0) {
+      throw new CursorModelDiscoveryError(
+        buildDiscoveryHttpError(response.exitCode, response.body),
+      );
+    }
+
+    if (response.body.length === 0) {
+      throw new CursorModelDiscoveryError(
+        "Cursor model discovery returned an empty response.",
+      );
     }
 
     const decoded = decodeGetUsableModelsResponse(response.body);
-    if (!decoded) return null;
+    if (!decoded) {
+      throw new CursorModelDiscoveryError(
+        "Cursor model discovery returned an unreadable response.",
+      );
+    }
 
     const models = normalizeCursorModels(decoded.models);
-    return models.length > 0 ? models : null;
-  } catch {
-    return null;
+    if (models.length === 0) {
+      throw new CursorModelDiscoveryError(
+        "Cursor model discovery returned no usable models.",
+      );
+    }
+
+    return models;
+  } catch (error) {
+    if (error instanceof CursorModelDiscoveryError) throw error;
+    throw new CursorModelDiscoveryError("Cursor model discovery failed.");
   }
 }
 
@@ -96,13 +111,39 @@ export async function getCursorModels(
 ): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
   const discovered = await fetchCursorUsableModels(apiKey);
-  cachedModels = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
+  cachedModels = discovered;
   return cachedModels;
 }
 
 /** @internal Test-only. */
 export function clearModelCache(): void {
   cachedModels = null;
+}
+
+function buildDiscoveryHttpError(exitCode: number, body: Uint8Array): string {
+  const detail = extractDiscoveryErrorDetail(body);
+  if (!detail) {
+    return `Cursor model discovery failed with HTTP ${exitCode}.`;
+  }
+  return `Cursor model discovery failed with HTTP ${exitCode}: ${detail}`;
+}
+
+function extractDiscoveryErrorDetail(body: Uint8Array): string | null {
+  if (body.length === 0) return null;
+
+  const text = new TextDecoder().decode(body).trim();
+  if (!text) return null;
+
+  try {
+    const parsed = JSON.parse(text) as { code?: unknown; message?: unknown };
+    const code = typeof parsed.code === "string" ? parsed.code : undefined;
+    const message = typeof parsed.message === "string" ? parsed.message : undefined;
+    if (message && code) return `${message} (${code})`;
+    if (message) return message;
+    if (code) return code;
+  } catch {}
+
+  return text.length > 200 ? `${text.slice(0, 197)}...` : text;
 }
 
 function decodeGetUsableModelsResponse(payload: Uint8Array): {
