@@ -21,7 +21,7 @@ import {
 } from "../src/proto/agent_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
-type RunSSEMode =
+type RunMode =
   | "close-on-append"
   | "end-stream-hold"
   | "interaction-tool-call-pause"
@@ -47,6 +47,7 @@ interface TestModules {
   stopProxy: typeof import("../src/proxy").stopProxy;
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   callCursorUnaryRpc: typeof import("../src/proxy").callCursorUnaryRpc;
+  createCursorSession: typeof import("../src/cursor").createCursorSession;
   configurePluginLogger: typeof import("../src/logger").configurePluginLogger;
   logPluginError: typeof import("../src/logger").logPluginError;
   flushPluginLogs: typeof import("../src/logger").flushPluginLogs;
@@ -64,12 +65,12 @@ interface TestCursorBackend {
   setDiscoveredModels: (
     models: Array<{ id: string; name: string; reasoning?: boolean }>,
   ) => void;
-  setRunSSEMode: (mode: RunSSEMode) => void;
+  setRunMode: (mode: RunMode) => void;
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
   getDiscoveryRequestBodies: () => Uint8Array[];
   getRefreshAuthHeaders: () => string[];
-  getBidiAppendCount: () => number;
+  getRunMessageCount: () => number;
   getObservedRunRequests: () => ObservedRunRequest[];
   getObservedNameAgentRequests: () => string[];
   close: () => Promise<void>;
@@ -121,41 +122,35 @@ function frameConnectEndStreamMessage(payload: Uint8Array): Buffer {
   return frame;
 }
 
-function readVarint(
-  bytes: Uint8Array,
-  startOffset: number,
-): { value: number; offset: number } {
-  let value = 0;
-  let shift = 0;
-  let offset = startOffset;
+function decodeConnectMessagePayloads(payload: Uint8Array): Uint8Array[] {
+  const messages: Uint8Array[] = [];
+  let offset = 0;
 
-  while (offset < bytes.length) {
-    const byte = bytes[offset]!;
-    value |= (byte & 0x7f) << shift;
-    offset += 1;
-    if ((byte & 0x80) === 0) {
-      return { value, offset };
+  while (offset + 5 <= payload.length) {
+    const messageLength = new DataView(
+      payload.buffer,
+      payload.byteOffset + offset,
+      payload.byteLength - offset,
+    ).getUint32(1, false);
+    const frameEnd = offset + 5 + messageLength;
+    if (frameEnd > payload.length) {
+      throw new Error("Invalid Connect frame payload");
     }
-    shift += 7;
+    messages.push(payload.subarray(offset + 5, frameEnd));
+    offset = frameEnd;
   }
 
-  throw new Error("Invalid varint");
+  if (offset !== payload.length) {
+    throw new Error("Trailing bytes after Connect frame payload");
+  }
+
+  return messages;
 }
 
 function decodeObservedRunRequest(
   payload: Uint8Array,
 ): ObservedRunRequest | null {
-  if (payload.length === 0 || payload[0] !== 0x0a) return null;
-
-  const { value: hexLength, offset } = readVarint(payload, 1);
-  const hexBytes = payload.subarray(offset, offset + hexLength);
-  const dataHex = new TextDecoder().decode(hexBytes);
-  if (!dataHex) return null;
-
-  const clientMessage = fromBinary(
-    AgentClientMessageSchema,
-    new Uint8Array(Buffer.from(dataHex, "hex")),
-  );
+  const clientMessage = fromBinary(AgentClientMessageSchema, payload);
   if (clientMessage.message.case !== "runRequest") return null;
 
   const runRequest = clientMessage.message.value;
@@ -416,7 +411,7 @@ function makeTurnEndedFrame(): Buffer {
 
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
-  let runSSEMode: RunSSEMode = "close-on-append";
+  let runMode: RunMode = "close-on-append";
   let discoveredModels: Array<{
     id: string;
     name: string;
@@ -427,7 +422,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const refreshAuthHeaders: string[] = [];
   const observedRunRequests: ObservedRunRequest[] = [];
   const observedNameAgentRequests: string[] = [];
-  let bidiAppendCount = 0;
+  let runMessageCount = 0;
 
   const refreshServer = http.createServer((req, res) => {
     if (req.method !== "POST" || req.url !== "/auth/exchange_user_api_key") {
@@ -458,31 +453,136 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   );
   const refreshPort = (refreshServer.address() as AddressInfo).port;
 
-  let pendingRunSSE: http.ServerResponse | null = null;
+  let activeRunStream: http2.ServerHttp2Stream | null = null;
+  let activeRunBuffer = Buffer.alloc(0);
+  let activeRunCloseTimer: NodeJS.Timeout | undefined;
   let toolCallIssued = false;
 
-  const apiServer = http.createServer((req, res) => {
-    const path = req.url ?? "";
-    const authHeader = req.headers.authorization ?? "";
-    const chunks: Buffer[] = [];
+  const clearActiveRunCloseTimer = () => {
+    if (!activeRunCloseTimer) return;
+    clearTimeout(activeRunCloseTimer);
+    activeRunCloseTimer = undefined;
+  };
 
-    req.on("data", (chunk) => {
+  const endActiveRunStream = () => {
+    clearActiveRunCloseTimer();
+    try {
+      activeRunStream?.end();
+    } catch {}
+    activeRunStream = null;
+    activeRunBuffer = Buffer.alloc(0);
+  };
+
+  const writeRunFrame = (frame: Buffer) => {
+    if (!activeRunStream) return;
+    activeRunStream.write(frame);
+  };
+
+  const handleRunMessage = (payload: Uint8Array) => {
+    runMessageCount += 1;
+    const observed = decodeObservedRunRequest(payload);
+    if (observed) observedRunRequests.push(observed);
+    if (!activeRunStream) return;
+
+    if (runMode === "close-on-append") {
+      endActiveRunStream();
+    } else if (runMode === "end-stream-hold" && runMessageCount === 1) {
+      writeRunFrame(frameConnectEndStreamMessage(new TextEncoder().encode("{}")));
+      activeRunCloseTimer = setTimeout(endActiveRunStream, 6_100);
+    } else if (runMode === "checkpoint-then-close") {
+      writeRunFrame(makeCheckpointUpdateFrame());
+      endActiveRunStream();
+    } else if (runMode === "interaction-tool-call-pause") {
+      writeRunFrame(makeInteractionToolCallCompletedFrame());
+    } else if (runMode === "interaction-native-tool-complete") {
+      writeRunFrame(makeTextDeltaFrame("native tool update ignored"));
+      writeRunFrame(makeInteractionNativeToolCallCompletedFrame());
+      writeRunFrame(makeTurnEndedFrame());
+    } else if (runMode === "unsupported-interaction-query-pause") {
+      writeRunFrame(makeUnsupportedInteractionQueryFrame());
+    } else if (runMode === "turn-ended-hold") {
+      writeRunFrame(makeTextDeltaFrame("completed response"));
+      writeRunFrame(makeTurnEndedFrame());
+    } else if (runMode === "verbose-title-close") {
+      writeRunFrame(
+        makeTextDeltaFrame(
+          "# That depends on which fish you're looking for! If you're referring to the famous 1998 techno hit ...",
+        ),
+      );
+      endActiveRunStream();
+    } else if (runMode === "tool-call-pause") {
+      if (!toolCallIssued) {
+        toolCallIssued = true;
+        writeRunFrame(makeToolCallFrame());
+      } else {
+        toolCallIssued = false;
+        endActiveRunStream();
+      }
+    } else if (runMode === "unsupported-exec-pause") {
+      writeRunFrame(makeUnsupportedExecFrame());
+      activeRunCloseTimer = setTimeout(endActiveRunStream, 2_000);
+    }
+  };
+
+  const appendRunData = (incoming: Buffer) => {
+    activeRunBuffer = Buffer.concat([activeRunBuffer, incoming]);
+    while (activeRunBuffer.length >= 5) {
+      const frameLength = activeRunBuffer.readUInt32BE(1);
+      if (activeRunBuffer.length < 5 + frameLength) break;
+      const payload = activeRunBuffer.subarray(5, 5 + frameLength);
+      activeRunBuffer = activeRunBuffer.subarray(5 + frameLength);
+      handleRunMessage(new Uint8Array(payload));
+    }
+  };
+
+  const readHeaderValue = (value: string | string[] | undefined): string =>
+    Array.isArray(value) ? value[0] ?? "" : (value ?? "");
+
+  const apiServer = http2.createServer();
+  apiServer.on("stream", (stream: http2.ServerHttp2Stream, headers) => {
+    const method = readHeaderValue(headers[":method"] as string | string[] | undefined);
+    const path = readHeaderValue(headers[":path"] as string | string[] | undefined);
+    const authHeader = readHeaderValue(headers.authorization);
+
+    if (method !== "POST") {
+      stream.respond({ ":status": 404 });
+      stream.end();
+      return;
+    }
+
+    if (path === "/agent.v1.AgentService/Run") {
+      clearActiveRunCloseTimer();
+      activeRunStream = stream;
+      activeRunBuffer = Buffer.alloc(0);
+      stream.respond({
+        ":status": 200,
+        "content-type": "application/connect+proto",
+      });
+      stream.on("data", (chunk) => {
+        appendRunData(Buffer.from(chunk));
+      });
+      stream.once("close", () => {
+        if (activeRunStream === stream) {
+          clearActiveRunCloseTimer();
+          activeRunStream = null;
+          activeRunBuffer = Buffer.alloc(0);
+        }
+      });
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    stream.on("data", (chunk) => {
       chunks.push(Buffer.from(chunk));
     });
-    req.on("end", () => {
-      if (req.method !== "POST") {
-        res.writeHead(404);
-        res.end();
-        return;
-      }
-
+    stream.once("end", () => {
       if (path === "/agent.v1.AgentService/GetUsableModels") {
         discoveryAuthHeaders.push(authHeader);
         discoveryRequestBodies.push(new Uint8Array(Buffer.concat(chunks)));
 
         if (discoveryMode === "auth-error") {
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(
+          stream.respond({ ":status": 401, "content-type": "application/json" });
+          stream.end(
             JSON.stringify({
               code: "unauthenticated",
               message: "expired token",
@@ -510,24 +610,11 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
                   }),
                 ),
               );
-        res.writeHead(200, { "Content-Type": "application/connect+proto" });
-        res.end(responseBody);
-        return;
-      }
-
-      if (path === "/agent.v1.AgentService/RunSSE") {
-        pendingRunSSE = res;
-        res.on("close", () => {
-          if (pendingRunSSE === res) {
-            pendingRunSSE = null;
-          }
+        stream.respond({
+          ":status": 200,
+          "content-type": "application/connect+proto",
         });
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        });
-        res.flushHeaders();
+        stream.end(Buffer.from(responseBody));
         return;
       }
 
@@ -545,92 +632,16 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
             }),
           ),
         );
-        res.writeHead(200, { "Content-Type": "application/connect+proto" });
-        res.end(responseBody);
+        stream.respond({
+          ":status": 200,
+          "content-type": "application/connect+proto",
+        });
+        stream.end(Buffer.from(responseBody));
         return;
       }
 
-      if (path === "/aiserver.v1.BidiService/BidiAppend") {
-        bidiAppendCount += 1;
-        const observed = decodeObservedRunRequest(
-          new Uint8Array(Buffer.concat(chunks)),
-        );
-        if (observed) observedRunRequests.push(observed);
-        res.writeHead(200, { "Content-Type": "application/proto" });
-        res.end();
-
-        if (runSSEMode === "close-on-append" && pendingRunSSE) {
-          pendingRunSSE.end();
-          pendingRunSSE = null;
-        } else if (
-          runSSEMode === "end-stream-hold" &&
-          pendingRunSSE &&
-          bidiAppendCount === 1
-        ) {
-          pendingRunSSE.write(
-            frameConnectEndStreamMessage(new TextEncoder().encode("{}")),
-          );
-          setTimeout(() => {
-            try {
-              pendingRunSSE?.end();
-            } catch {}
-            pendingRunSSE = null;
-          }, 6_100);
-        } else if (runSSEMode === "checkpoint-then-close" && pendingRunSSE) {
-          pendingRunSSE.write(makeCheckpointUpdateFrame());
-          pendingRunSSE.end();
-          pendingRunSSE = null;
-        } else if (
-          runSSEMode === "interaction-tool-call-pause" &&
-          pendingRunSSE
-        ) {
-          pendingRunSSE.write(makeInteractionToolCallCompletedFrame());
-        } else if (
-          runSSEMode === "interaction-native-tool-complete" &&
-          pendingRunSSE
-        ) {
-          pendingRunSSE.write(makeTextDeltaFrame("native tool update ignored"));
-          pendingRunSSE.write(makeInteractionNativeToolCallCompletedFrame());
-          pendingRunSSE.write(makeTurnEndedFrame());
-        } else if (
-          runSSEMode === "unsupported-interaction-query-pause" &&
-          pendingRunSSE
-        ) {
-          pendingRunSSE.write(makeUnsupportedInteractionQueryFrame());
-        } else if (runSSEMode === "turn-ended-hold" && pendingRunSSE) {
-          pendingRunSSE.write(makeTextDeltaFrame("completed response"));
-          pendingRunSSE.write(makeTurnEndedFrame());
-        } else if (runSSEMode === "verbose-title-close" && pendingRunSSE) {
-          pendingRunSSE.write(
-            makeTextDeltaFrame(
-              "# That depends on which fish you're looking for! If you're referring to the famous 1998 techno hit ...",
-            ),
-          );
-          pendingRunSSE.end();
-          pendingRunSSE = null;
-        } else if (runSSEMode === "tool-call-pause" && pendingRunSSE) {
-          if (!toolCallIssued) {
-            toolCallIssued = true;
-            pendingRunSSE.write(makeToolCallFrame());
-          } else {
-            pendingRunSSE.end();
-            pendingRunSSE = null;
-            toolCallIssued = false;
-          }
-        } else if (runSSEMode === "unsupported-exec-pause" && pendingRunSSE) {
-          pendingRunSSE.write(makeUnsupportedExecFrame());
-          setTimeout(() => {
-            try {
-              pendingRunSSE?.end();
-            } catch {}
-            pendingRunSSE = null;
-          }, 2_000);
-        }
-        return;
-      }
-
-      res.writeHead(404);
-      res.end();
+      stream.respond({ ":status": 404 });
+      stream.end();
     });
   });
   await new Promise<void>((resolve) =>
@@ -647,8 +658,8 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     setDiscoveredModels(models) {
       discoveredModels = models;
     },
-    setRunSSEMode(mode) {
-      runSSEMode = mode;
+    setRunMode(mode) {
+      runMode = mode;
     },
     resetObservations() {
       discoveryAuthHeaders.length = 0;
@@ -656,7 +667,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       refreshAuthHeaders.length = 0;
       observedRunRequests.length = 0;
       observedNameAgentRequests.length = 0;
-      bidiAppendCount = 0;
+      runMessageCount = 0;
       toolCallIssued = false;
     },
     getDiscoveryAuthHeaders() {
@@ -668,8 +679,8 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
     getRefreshAuthHeaders() {
       return [...refreshAuthHeaders];
     },
-    getBidiAppendCount() {
-      return bidiAppendCount;
+    getRunMessageCount() {
+      return runMessageCount;
     },
     getObservedRunRequests() {
       return observedRunRequests.map((request) => ({
@@ -681,12 +692,17 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       return [...observedNameAgentRequests];
     },
     async close() {
+      clearActiveRunCloseTimer();
+      try {
+        activeRunStream?.close();
+      } catch {}
       for (const server of [apiServer, refreshServer]) {
+        const closable = server as any;
         try {
-          server.closeIdleConnections?.();
+          closable.closeIdleConnections?.();
         } catch {}
         try {
-          server.closeAllConnections?.();
+          closable.closeAllConnections?.();
         } catch {}
         try {
           server.close();
@@ -697,6 +713,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
 }
 
 async function loadModules(): Promise<TestModules> {
+  const cursor = await import("../src/cursor");
   const proxy = await import("../src/proxy");
   const auth = await import("../src/auth");
   const index = await import("../src/index");
@@ -707,6 +724,7 @@ async function loadModules(): Promise<TestModules> {
     stopProxy: proxy.stopProxy,
     getProxyPort: proxy.getProxyPort,
     callCursorUnaryRpc: proxy.callCursorUnaryRpc,
+    createCursorSession: cursor.createCursorSession,
     configurePluginLogger: logger.configurePluginLogger,
     logPluginError: logger.logPluginError,
     flushPluginLogs: logger.flushPluginLogs,
@@ -879,7 +897,6 @@ async function testHttp2UnaryRpc(modules: TestModules) {
       rpcPath: "/agent.v1.AgentService/GetUsableModels",
       requestBody: new Uint8Array([1, 2, 3]),
       timeoutMs: 5_000,
-      transport: "http2",
       url: `http://127.0.0.1:${port}`,
     });
 
@@ -924,6 +941,111 @@ async function testHttp2UnaryRpc(modules: TestModules) {
   }
 
   console.log("[test] HTTP/2 unary discovery transport OK");
+}
+
+async function testHttp2BidiSessionTransport(modules: TestModules) {
+  console.log("[test] Testing HTTP/2 bidi Cursor transport...");
+
+  let observedHeaders: http2.IncomingHttpHeaders | undefined;
+  let observedFrames: Uint8Array[] = [];
+  let resolveClosed: (() => void) | undefined;
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  const serverResponse = frameConnectUnaryMessage(new Uint8Array([4, 5, 6]));
+
+  const server = http2.createServer();
+  server.on("stream", (stream: http2.ServerHttp2Stream, headers) => {
+    observedHeaders = headers;
+    const chunks: Buffer[] = [];
+
+    stream.respond({
+      ":status": 200,
+      "content-type": "application/connect+proto",
+    });
+    stream.write(serverResponse);
+    stream.on("data", (chunk) => {
+      chunks.push(Buffer.from(chunk));
+    });
+    stream.once("close", () => {
+      observedFrames = decodeConnectMessagePayloads(
+        new Uint8Array(Buffer.concat(chunks)),
+      );
+      resolveClosed?.();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+
+  try {
+    const session = await modules.createCursorSession({
+      accessToken: "test-access-token",
+      initialRequestBytes: new Uint8Array([1, 2, 3]),
+      url: `http://127.0.0.1:${port}`,
+    });
+
+    const responseChunks: Buffer[] = [];
+    session.onData((chunk) => {
+      responseChunks.push(Buffer.from(chunk));
+    });
+
+    session.write(new Uint8Array([9, 8, 7]));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    session.end();
+    await Promise.race([
+      closed,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("HTTP/2 bidi session did not close")), 1_000),
+      ),
+    ]);
+
+    assertEqual(
+      observedHeaders?.[":path"],
+      "/agent.v1.AgentService/Run",
+      "Expected HTTP/2 bidi run path",
+    );
+    assertEqual(
+      observedHeaders?.["connect-protocol-version"],
+      "1",
+      "Expected Connect protocol version header on bidi transport",
+    );
+    assertEqual(
+      observedHeaders?.["content-type"],
+      "application/connect+proto",
+      "Expected Connect streaming content type on bidi transport",
+    );
+    assertEqual(
+      observedHeaders?.authorization,
+      "Bearer test-access-token",
+      "Expected bearer token auth on bidi transport",
+    );
+    assertEqual(
+      observedFrames.length,
+      2,
+      "Expected initial and follow-up Connect request messages",
+    );
+    assertArrayEqual(
+      [...observedFrames[0]!].map(String),
+      ["1", "2", "3"],
+      "Expected initial request message to be framed and forwarded",
+    );
+    assertArrayEqual(
+      [...observedFrames[1]!].map(String),
+      ["9", "8", "7"],
+      "Expected follow-up request message to use the same HTTP/2 stream",
+    );
+    assertArrayEqual(
+      [...Buffer.concat(responseChunks)].map(String),
+      [...serverResponse].map(String),
+      "Expected bidi transport to surface streamed server frames",
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+
+  console.log("[test] HTTP/2 bidi Cursor transport OK");
 }
 
 async function testProxyStartStop(modules: TestModules) {
@@ -1282,7 +1404,7 @@ async function testEndStreamStopsHeartbeats(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("end-stream-hold");
+    backend.setRunMode("end-stream-hold");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const response = await fetch(
@@ -1310,13 +1432,13 @@ async function testEndStreamStopsHeartbeats(
 
     await new Promise((resolve) => setTimeout(resolve, 5_500));
     assertEqual(
-      backend.getBidiAppendCount(),
+      backend.getRunMessageCount(),
       1,
       "Expected proxy to stop heartbeats after receiving Connect end-stream",
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Connect end-stream bridge shutdown OK");
@@ -1330,7 +1452,7 @@ async function testTurnEndedStopsStreamingResponse(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("turn-ended-hold");
+    backend.setRunMode("turn-ended-hold");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const response = await fetch(
@@ -1362,13 +1484,13 @@ async function testTurnEndedStopsStreamingResponse(
 
     await new Promise((resolve) => setTimeout(resolve, 5_500));
     assertEqual(
-      backend.getBidiAppendCount(),
+      backend.getRunMessageCount(),
       1,
       "Expected proxy to stop heartbeats after receiving turn-ended",
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Turn-ended bridge shutdown OK");
@@ -1382,7 +1504,7 @@ async function testInteractionToolCallCompletesStreamingResponse(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("interaction-tool-call-pause");
+    backend.setRunMode("interaction-tool-call-pause");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const response = await fetch(
@@ -1413,7 +1535,7 @@ async function testInteractionToolCallCompletesStreamingResponse(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Interaction-update MCP tool call handling OK");
@@ -1427,7 +1549,7 @@ async function testNativeInteractionToolCallCompletedDoesNotAbort(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("interaction-native-tool-complete");
+    backend.setRunMode("interaction-native-tool-complete");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const response = await fetch(
@@ -1469,7 +1591,7 @@ async function testNativeInteractionToolCallCompletedDoesNotAbort(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Native interaction tool completion ignore OK");
@@ -1483,7 +1605,7 @@ async function testSessionHeadersPreserveConversationState(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("checkpoint-then-close");
+    backend.setRunMode("checkpoint-then-close");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const headers = {
@@ -1550,7 +1672,7 @@ async function testSessionHeadersPreserveConversationState(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Session header conversation reuse OK");
@@ -1564,7 +1686,7 @@ async function testAgentScopedSessionIsolation(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("checkpoint-then-close");
+    backend.setRunMode("checkpoint-then-close");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const buildHeaders = {
@@ -1639,7 +1761,7 @@ async function testAgentScopedSessionIsolation(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Agent-scoped session isolation OK");
@@ -1653,7 +1775,7 @@ async function testModelSwitchPreservesConversationState(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("checkpoint-then-close");
+    backend.setRunMode("checkpoint-then-close");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const headers = {
@@ -1698,7 +1820,7 @@ async function testModelSwitchPreservesConversationState(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Model switch conversation reuse OK");
@@ -1712,7 +1834,7 @@ async function testProviderSwitchHistoryReconstruction(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("verbose-title-close");
+    backend.setRunMode("verbose-title-close");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
 
@@ -1819,7 +1941,7 @@ async function testPlainTextProviderSwitchHandoff(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
 
@@ -1886,7 +2008,7 @@ async function testAssistantLastContinuationWithoutCheckpointUsesGenericHandling
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
 
@@ -1948,7 +2070,7 @@ async function testAssistantLastContinuationWithCheckpointUsesGenericHandling(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("checkpoint-then-close");
+    backend.setRunMode("checkpoint-then-close");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const headers = {
@@ -1971,7 +2093,7 @@ async function testAssistantLastContinuationWithCheckpointUsesGenericHandling(
     assertEqual(firstResponse.status, 200, "Expected initial request to succeed");
 
     backend.resetObservations();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
 
     const secondResponse = await fetch(
       `http://localhost:${proxyPort}/v1/chat/completions`,
@@ -2013,7 +2135,7 @@ async function testAssistantLastContinuationWithCheckpointUsesGenericHandling(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Assistant-last continuation generic handling with checkpoint OK");
@@ -2027,7 +2149,7 @@ async function testSystemPromptForwardedToCursorRunRequest(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
 
@@ -2094,7 +2216,7 @@ async function testSystemPromptForwardedToCursorRunRequest(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Source-backed title-agent naming RPC OK");
@@ -2110,7 +2232,7 @@ async function testPendingToolResultResumeAcrossModelSwitch(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("tool-call-pause");
+    backend.setRunMode("tool-call-pause");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const headers = {
@@ -2194,7 +2316,7 @@ async function testPendingToolResultResumeAcrossModelSwitch(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Pending tool result resume across model switch OK");
@@ -2208,7 +2330,7 @@ async function testUnsupportedExecFailsFast(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("unsupported-exec-pause");
+    backend.setRunMode("unsupported-exec-pause");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const response = await fetch(
@@ -2249,7 +2371,7 @@ async function testUnsupportedExecFailsFast(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Unsupported exec fast failure OK");
@@ -2263,7 +2385,7 @@ async function testUnsupportedInteractionQueryFailsFast(
 
   try {
     backend.resetObservations();
-    backend.setRunSSEMode("unsupported-interaction-query-pause");
+    backend.setRunMode("unsupported-interaction-query-pause");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const response = await fetch(
@@ -2304,7 +2426,7 @@ async function testUnsupportedInteractionQueryFailsFast(
     );
   } finally {
     modules.stopProxy();
-    backend.setRunSSEMode("close-on-append");
+    backend.setRunMode("close-on-append");
   }
 
   console.log("[test] Unsupported interaction query fast failure OK");
@@ -2325,6 +2447,7 @@ async function main() {
     await testPluginLogging(modules);
     await testRejectedChatCompletionLogging(modules);
     await testHttp2UnaryRpc(modules);
+    await testHttp2BidiSessionTransport(modules);
     await testArrayContentParsing(modules);
     await testSessionHeadersPreserveConversationState(modules, backend);
     await testAgentScopedSessionIsolation(modules, backend);

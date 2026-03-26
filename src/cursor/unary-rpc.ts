@@ -6,8 +6,7 @@ import {
   type OutgoingHttpHeaders,
 } from "node:http2";
 import { CURSOR_API_URL, CURSOR_CONNECT_PROTOCOL_VERSION } from "./config";
-import { toFetchBody } from "./connect-framing";
-import { buildCursorHeaders, buildCursorHeaderValues } from "./headers";
+import { buildCursorHeaderValues } from "./headers";
 import { errorDetails, logPluginError } from "../logger";
 
 export interface CursorUnaryRpcOptions {
@@ -16,80 +15,13 @@ export interface CursorUnaryRpcOptions {
   requestBody: Uint8Array;
   url?: string;
   timeoutMs?: number;
-  transport?: "auto" | "fetch" | "http2";
 }
 
 export async function callCursorUnaryRpc(
   options: CursorUnaryRpcOptions,
 ): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
   const target = new URL(options.rpcPath, options.url ?? CURSOR_API_URL);
-  const transport = options.transport ?? "auto";
-
-  if (
-    transport === "http2" ||
-    (transport === "auto" && target.protocol === "https:")
-  ) {
-    const http2Result = await callCursorUnaryRpcOverHttp2(options, target);
-    if (
-      transport === "http2" ||
-      http2Result.timedOut ||
-      http2Result.exitCode !== 1
-    ) {
-      return http2Result;
-    }
-  }
-
-  return callCursorUnaryRpcOverFetch(options, target);
-}
-
-async function callCursorUnaryRpcOverFetch(
-  options: CursorUnaryRpcOptions,
-  target: URL,
-): Promise<{ body: Uint8Array; exitCode: number; timedOut: boolean }> {
-  let timedOut = false;
-  const timeoutMs = options.timeoutMs ?? 5_000;
-  const controller = new AbortController();
-  const timeout =
-    timeoutMs > 0
-      ? setTimeout(() => {
-          timedOut = true;
-          controller.abort();
-        }, timeoutMs)
-      : undefined;
-
-  try {
-    const response = await fetch(target, {
-      method: "POST",
-      headers: buildCursorHeaders(options, "application/proto", {
-        accept: "application/proto, application/json",
-        "connect-protocol-version": CURSOR_CONNECT_PROTOCOL_VERSION,
-        "connect-timeout-ms": String(timeoutMs),
-      }),
-      body: toFetchBody(options.requestBody),
-      signal: controller.signal,
-    });
-
-    const body = new Uint8Array(await response.arrayBuffer());
-    return {
-      body,
-      exitCode: response.ok ? 0 : response.status,
-      timedOut,
-    };
-  } catch {
-    logPluginError("Cursor unary fetch transport failed", {
-      rpcPath: options.rpcPath,
-      url: target.toString(),
-      timeoutMs,
-      timedOut,
-    });
-    return {
-      body: new Uint8Array(),
-      exitCode: timedOut ? 124 : 1,
-      timedOut,
-    };
-  } finally {
-    if (timeout) clearTimeout(timeout);
-  }
+  return callCursorUnaryRpcOverHttp2(options, target);
 }
 
 async function callCursorUnaryRpcOverHttp2(

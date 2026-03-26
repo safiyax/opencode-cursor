@@ -21,7 +21,6 @@ export {
 } from "./headers";
 export {
   createCursorSession,
-  encodeBidiAppendRequest,
   type CreateCursorSessionOptions,
   type CursorSession,
 } from "./bidi-session";
