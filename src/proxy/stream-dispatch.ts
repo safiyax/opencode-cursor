@@ -198,7 +198,13 @@ export function processServerMessage(
   const msgCase = msg.message.case;
 
   if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, state, onText, onTurnEnded);
+    handleInteractionUpdate(
+      msg.message.value,
+      state,
+      onText,
+      onMcpExec,
+      onTurnEnded,
+    );
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
@@ -224,6 +230,7 @@ function handleInteractionUpdate(
   update: any,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
+  onMcpExec: (exec: PendingExec) => void,
   onTurnEnded?: () => void,
 ): void {
   const updateCase = update.message?.case;
@@ -236,12 +243,73 @@ function handleInteractionUpdate(
     if (delta) onText(delta, true);
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
+  } else if (updateCase === "partialToolCall") {
+    const partial = update.message.value;
+    if (partial.callId && partial.argsTextDelta) {
+      state.interactionToolArgsText.set(partial.callId, partial.argsTextDelta);
+    }
+  } else if (updateCase === "toolCallCompleted") {
+    const exec = decodeInteractionToolCall(update.message.value, state);
+    if (exec) onMcpExec(exec);
   } else if (updateCase === "turnEnded") {
     onTurnEnded?.();
   }
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec
   // message path (mcpArgs → mcpResult), not interaction updates.
+}
+
+function decodeInteractionToolCall(
+  update: {
+    callId?: string;
+    toolCall?: {
+      tool?: {
+        case?: string;
+        value?: {
+          args?: {
+            name?: string;
+            toolName?: string;
+            toolCallId?: string;
+            args?: Record<string, Uint8Array>;
+          };
+        };
+      };
+    };
+  },
+  state: StreamState,
+): PendingExec | null {
+  const callId = update.callId ?? "";
+  const toolCase = update.toolCall?.tool?.case;
+  if (toolCase !== "mcpToolCall") return null;
+
+  const mcpArgs = update.toolCall?.tool?.value?.args;
+  if (!mcpArgs) return null;
+
+  const toolCallId = mcpArgs.toolCallId || callId || crypto.randomUUID();
+  if (state.emittedToolCallIds.has(toolCallId)) return null;
+
+  const decodedMap = decodeMcpArgsMap(mcpArgs.args ?? {});
+  const partialArgsText = callId
+    ? state.interactionToolArgsText.get(callId)?.trim()
+    : undefined;
+
+  let decodedArgs = "{}";
+  if (Object.keys(decodedMap).length > 0) {
+    decodedArgs = JSON.stringify(decodedMap);
+  } else if (partialArgsText) {
+    decodedArgs = partialArgsText;
+  }
+
+  state.emittedToolCallIds.add(toolCallId);
+  if (callId) state.interactionToolArgsText.delete(callId);
+
+  return {
+    execId: callId || toolCallId,
+    execMsgId: 0,
+    toolCallId,
+    toolName: mcpArgs.toolName || mcpArgs.name || "unknown_mcp_tool",
+    decodedArgs,
+  };
 }
 
 /** Send a KV client response back to Cursor. */

@@ -94,6 +94,8 @@ async function collectFullResponse(
     pendingExecs: [],
     outputTokens: 0,
     totalTokens: 0,
+    interactionToolArgsText: new Map(),
+    emittedToolCallIds: new Set(),
   };
   const tagFilter = createThinkingTagFilter();
 

@@ -24,6 +24,7 @@ type DiscoveryMode = "success" | "empty" | "auth-error";
 type RunSSEMode =
   | "close-on-append"
   | "end-stream-hold"
+  | "interaction-tool-call-pause"
   | "turn-ended-hold"
   | "checkpoint-then-close"
   | "tool-call-pause"
@@ -214,6 +215,45 @@ function makeToolCallFrame(): Buffer {
     message: {
       case: "execServerMessage",
       value: execMessage,
+    },
+  });
+  return frameConnectUnaryMessage(
+    toBinary(AgentServerMessageSchema, serverMessage),
+  );
+}
+
+function makeInteractionToolCallCompletedFrame(): Buffer {
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: {
+        message: {
+          case: "toolCallCompleted",
+          value: {
+            callId: "interaction-call-1",
+            modelCallId: "model-call-1",
+            toolCall: {
+              tool: {
+                case: "mcpToolCall",
+                value: {
+                  args: {
+                    name: "read_file",
+                    toolName: "read_file",
+                    toolCallId: "interaction-call-1",
+                    providerIdentifier: "opencode",
+                    args: {
+                      path: toBinary(
+                        ValueSchema,
+                        fromJson(ValueSchema, "src/index.ts"),
+                      ),
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      } as any,
     },
   });
   return frameConnectUnaryMessage(
@@ -482,6 +522,11 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           pendingRunSSE.write(makeCheckpointUpdateFrame());
           pendingRunSSE.end();
           pendingRunSSE = null;
+        } else if (
+          runSSEMode === "interaction-tool-call-pause" &&
+          pendingRunSSE
+        ) {
+          pendingRunSSE.write(makeInteractionToolCallCompletedFrame());
         } else if (runSSEMode === "turn-ended-hold" && pendingRunSSE) {
           pendingRunSSE.write(makeTextDeltaFrame("completed response"));
           pendingRunSSE.write(makeTurnEndedFrame());
@@ -1196,6 +1241,51 @@ async function testTurnEndedStopsStreamingResponse(
   console.log("[test] Turn-ended bridge shutdown OK");
 }
 
+async function testInteractionToolCallCompletesStreamingResponse(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing interaction-update MCP tool call handling...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("interaction-tool-call-pause");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+    const response = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2",
+          messages: [{ role: "user", content: "inspect the file" }],
+        }),
+      },
+    );
+
+    assertEqual(
+      response.status,
+      200,
+      "Expected streaming chat completion to succeed",
+    );
+    const body = await response.text();
+    assert(
+      body.includes('"finish_reason":"tool_calls"'),
+      `Expected SSE stream to emit tool_calls finish after interaction update, got ${JSON.stringify(body)}`,
+    );
+    assert(
+      body.includes("data: [DONE]"),
+      `Expected SSE stream to terminate after interaction update tool call, got ${JSON.stringify(body)}`,
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setRunSSEMode("close-on-append");
+  }
+
+  console.log("[test] Interaction-update MCP tool call handling OK");
+}
+
 async function testSessionHeadersPreserveConversationState(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -1852,6 +1942,7 @@ async function main() {
     await testUnsupportedExecFailsFast(modules, backend);
     await testEndStreamStopsHeartbeats(modules, backend);
     await testTurnEndedStopsStreamingResponse(modules, backend);
+    await testInteractionToolCallCompletesStreamingResponse(modules, backend);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFailureAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");

@@ -70,6 +70,8 @@ function createBridgeStreamResponse(
         pendingExecs: [],
         outputTokens: 0,
         totalTokens: 0,
+        interactionToolArgsText: new Map(),
+        emittedToolCallIds: new Set(),
       };
       const tagFilter = createThinkingTagFilter();
       let assistantText = metadata.assistantSeedText ?? "";
