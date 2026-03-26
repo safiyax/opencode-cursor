@@ -35,6 +35,7 @@ type RunSSEMode =
 interface ObservedRunRequest {
   conversationId: string;
   turnCount: number;
+  actionCase: string;
   latestUserText: string;
   turns: Array<{ userText: string; assistantText: string }>;
   customSystemPrompt: string;
@@ -186,6 +187,7 @@ function decodeObservedRunRequest(
   return {
     conversationId: runRequest.conversationId ?? "",
     turnCount: runRequest.conversationState?.turns.length ?? 0,
+    actionCase: action?.case ?? "",
     latestUserText:
       action?.case === "userMessageAction"
         ? (action.value.userMessage?.text ?? "")
@@ -1719,6 +1721,141 @@ async function testPlainTextProviderSwitchHandoff(
   console.log("[test] Plain-text provider-switch handoff OK");
 }
 
+async function testAssistantLastContinuationWithoutCheckpointFails(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log(
+    "[test] Testing assistant-last continuation without checkpoint...",
+  );
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("close-on-append");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+
+    const response = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2",
+          stream: false,
+          messages: [
+            { role: "user", content: "Please try out all the tools." },
+            {
+              role: "assistant",
+              content: "Demonstrating each available tool with minimal, safe invocations.",
+            },
+          ],
+        }),
+      },
+    );
+
+    assertEqual(
+      response.status,
+      400,
+      "Expected assistant-last continuation without checkpoint to fail",
+    );
+    const body = (await response.json()) as { error?: { message?: string } };
+    assertEqual(
+      body.error?.message,
+      "Assistant-last continuation requires an existing Cursor checkpoint",
+      "Expected explicit assistant-last continuation error",
+    );
+    const observed = backend.getObservedRunRequests();
+    assertEqual(
+      observed.length,
+      0,
+      "Expected no Cursor run request when assistant-last continuation cannot be resumed",
+    );
+  } finally {
+    modules.stopProxy();
+  }
+
+  console.log("[test] Assistant-last continuation without checkpoint OK");
+}
+
+async function testAssistantLastContinuationUsesResumeAction(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing assistant-last continuation resume...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("checkpoint-then-close");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+    const headers = {
+      "Content-Type": "application/json",
+      "x-opencode-session-id": "ses-assistant-last",
+    };
+
+    const firstResponse = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "composer-2",
+          stream: false,
+          messages: [{ role: "user", content: "Please try out all the tools." }],
+        }),
+      },
+    );
+    assertEqual(firstResponse.status, 200, "Expected initial request to succeed");
+
+    backend.resetObservations();
+    backend.setRunSSEMode("close-on-append");
+
+    const secondResponse = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "composer-2",
+          stream: false,
+          messages: [
+            { role: "user", content: "Please try out all the tools." },
+            {
+              role: "assistant",
+              content:
+                "Demonstrating each available tool with minimal, safe invocations.",
+            },
+          ],
+        }),
+      },
+    );
+    assertEqual(
+      secondResponse.status,
+      200,
+      "Expected assistant-last continuation with checkpoint to succeed",
+    );
+
+    const observed = backend.getObservedRunRequests();
+    assertEqual(observed.length, 1, "Expected one observed Cursor run request");
+    assertEqual(
+      observed[0]?.actionCase,
+      "resumeAction",
+      `Expected assistant-last continuation to use ResumeAction, got ${JSON.stringify(observed[0])}`,
+    );
+    assertEqual(
+      observed[0]?.latestUserText,
+      "",
+      `Expected ResumeAction request to avoid a synthetic handoff prompt, got ${JSON.stringify(observed[0])}`,
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setRunSSEMode("close-on-append");
+  }
+
+  console.log("[test] Assistant-last continuation resume OK");
+}
+
 async function testSystemPromptForwardedToCursorRunRequest(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -2018,6 +2155,8 @@ async function main() {
     await testModelSwitchPreservesConversationState(modules, backend);
     await testProviderSwitchHistoryReconstruction(modules, backend);
     await testPlainTextProviderSwitchHandoff(modules, backend);
+    await testAssistantLastContinuationWithoutCheckpointFails(modules, backend);
+    await testAssistantLastContinuationUsesResumeAction(modules, backend);
     await testSystemPromptForwardedToCursorRunRequest(modules, backend);
     await testPendingToolResultResumeAcrossModelSwitch(modules, backend);
     await testUnsupportedExecFailsFast(modules, backend);

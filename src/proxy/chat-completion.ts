@@ -22,7 +22,7 @@ import {
   normalizeAgentKey,
   resetStoredConversation,
 } from "./conversation-state";
-import { buildCursorRequest } from "./cursor-request";
+import { buildCursorRequest, buildCursorResumeRequest } from "./cursor-request";
 import {
   handleNonStreamingResponse,
   handleStreamingResponse,
@@ -43,6 +43,7 @@ export function handleChatCompletion(
     toolResults,
     pendingAssistantSummary,
     completedTurnsFingerprint,
+    assistantContinuation,
   } = parsed;
   const modelId = body.model;
   const normalizedAgentKey = normalizeAgentKey(context.agentKey);
@@ -160,6 +161,58 @@ export function handleChatCompletion(
   stored.completedTurnsFingerprint = completedTurnsFingerprint;
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
+
+  if (assistantContinuation) {
+    if (!stored.checkpoint) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            message:
+              "Assistant-last continuation requires an existing Cursor checkpoint",
+            type: "invalid_request_error",
+          },
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const payload = buildCursorResumeRequest(
+      modelId,
+      systemPrompt,
+      stored.conversationId,
+      stored.checkpoint,
+      stored.blobStore,
+    );
+    payload.mcpTools = buildMcpToolDefinitions(tools);
+
+    const metadata = {
+      systemPrompt,
+      systemPromptHash,
+      completedTurnsFingerprint,
+      turns,
+      userText,
+      assistantSeedText: pendingAssistantSummary,
+      agentKey: normalizedAgentKey,
+    };
+
+    if (body.stream === false) {
+      return handleNonStreamingResponse(
+        payload,
+        accessToken,
+        modelId,
+        convKey,
+        metadata,
+      );
+    }
+    return handleStreamingResponse(
+      payload,
+      accessToken,
+      modelId,
+      bridgeKey,
+      convKey,
+      metadata,
+    );
+  }
 
   // Build the request. When tool results are present but the bridge died,
   // we must still include the last user text so Cursor has context.

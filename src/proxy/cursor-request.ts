@@ -10,6 +10,7 @@ import {
   ConversationTurnStructureSchema,
   AssistantMessageSchema,
   ModelDetailsSchema,
+  ResumeActionSchema,
   UserMessageActionSchema,
   UserMessageSchema,
 } from "../proto/agent_pb";
@@ -96,6 +97,59 @@ export function buildCursorRequest(
       value: create(UserMessageActionSchema, { userMessage }),
     },
   });
+
+  return buildRunRequest(
+    modelId,
+    conversationId,
+    conversationState,
+    action,
+    blobStore,
+  );
+}
+
+export function buildCursorResumeRequest(
+  modelId: string,
+  systemPrompt: string,
+  conversationId: string,
+  checkpoint: Uint8Array,
+  existingBlobStore?: Map<string, Uint8Array>,
+): CursorRequestPayload {
+  const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
+
+  const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
+  const systemBytes = new TextEncoder().encode(systemJson);
+  const systemBlobId = new Uint8Array(
+    createHash("sha256").update(systemBytes).digest(),
+  );
+  blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
+
+  const conversationState = fromBinary(
+    ConversationStateStructureSchema,
+    checkpoint,
+  );
+  const action = create(ConversationActionSchema, {
+    action: {
+      case: "resumeAction",
+      value: create(ResumeActionSchema, {}),
+    },
+  });
+
+  return buildRunRequest(
+    modelId,
+    conversationId,
+    conversationState,
+    action,
+    blobStore,
+  );
+}
+
+function buildRunRequest(
+  modelId: string,
+  conversationId: string,
+  conversationState: ReturnType<typeof create<typeof ConversationStateStructureSchema>>,
+  action: ReturnType<typeof create<typeof ConversationActionSchema>>,
+  blobStore: Map<string, Uint8Array>,
+): CursorRequestPayload {
 
   const modelDetails = create(ModelDetailsSchema, {
     modelId,

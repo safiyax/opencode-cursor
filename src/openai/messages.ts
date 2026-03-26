@@ -19,6 +19,7 @@ interface ParsedMessages {
   toolResults: ToolResultInfo[];
   pendingAssistantSummary: string;
   completedTurnsFingerprint: string;
+  assistantContinuation: boolean;
 }
 
 /** Normalize OpenAI message content to a plain string. */
@@ -115,6 +116,7 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let userText = "";
   let toolResults: ToolResultInfo[] = [];
   let pendingAssistantSummary = "";
+  let assistantContinuation = false;
   let completedTurnStates = parsedTurns;
 
   const lastTurn = parsedTurns.at(-1);
@@ -130,6 +132,11 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     } else if (lastTurn.userText && lastTurn.segments.length === 0) {
       completedTurnStates = parsedTurns.slice(0, -1);
       userText = lastTurn.userText;
+    } else if (lastTurn.userText && hasAssistantSummary) {
+      completedTurnStates = parsedTurns.slice(0, -1);
+      userText = lastTurn.userText;
+      pendingAssistantSummary = summarizeTurnSegments(lastTurn.segments);
+      assistantContinuation = true;
     }
   }
 
@@ -150,6 +157,7 @@ export function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
       systemPrompt,
       turns,
     ),
+    assistantContinuation,
   };
 }
 
