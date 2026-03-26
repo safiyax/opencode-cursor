@@ -64,10 +64,7 @@ export async function startProxy(
             );
           }
           const accessToken = await proxyAccessTokenProvider();
-          const sessionId =
-            req.headers.get("x-opencode-session-id") ??
-            req.headers.get("x-session-id") ??
-            undefined;
+          const sessionId = req.headers.get("x-session-id") ?? undefined;
           const agentKey = req.headers.get("x-opencode-agent") ?? undefined;
           const response = await handleChatCompletion(body, accessToken, {
             sessionId,

@@ -1396,7 +1396,7 @@ async function testSessionHeadersPreserveConversationState(
     const proxyPort = await modules.startProxy(async () => "test-token");
     const headers = {
       "Content-Type": "application/json",
-      "x-opencode-session-id": "ses-test-shared",
+      "x-session-id": "ses-test-shared",
     };
 
     const firstResponse = await fetch(
@@ -1477,12 +1477,12 @@ async function testAgentScopedSessionIsolation(
     const proxyPort = await modules.startProxy(async () => "test-token");
     const buildHeaders = {
       "Content-Type": "application/json",
-      "x-opencode-session-id": "ses-agent-shared",
+      "x-session-id": "ses-agent-shared",
       "x-opencode-agent": "build",
     };
     const titleHeaders = {
       "Content-Type": "application/json",
-      "x-opencode-session-id": "ses-agent-shared",
+      "x-session-id": "ses-agent-shared",
       "x-opencode-agent": "title",
     };
 
@@ -1566,7 +1566,7 @@ async function testModelSwitchPreservesConversationState(
     const proxyPort = await modules.startProxy(async () => "test-token");
     const headers = {
       "Content-Type": "application/json",
-      "x-opencode-session-id": "ses-model-shared",
+      "x-session-id": "ses-model-shared",
       "x-opencode-agent": "build",
     };
 
@@ -1861,7 +1861,7 @@ async function testAssistantLastContinuationWithCheckpointUsesGenericHandling(
     const proxyPort = await modules.startProxy(async () => "test-token");
     const headers = {
       "Content-Type": "application/json",
-      "x-opencode-session-id": "ses-assistant-last",
+      "x-session-id": "ses-assistant-last",
     };
 
     const firstResponse = await fetch(
@@ -1945,7 +1945,7 @@ async function testSystemPromptForwardedToCursorRunRequest(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-opencode-session-id": "ses-title-agent",
+          "x-session-id": "ses-title-agent",
         },
         body: JSON.stringify({
           model: "composer-2",
@@ -2023,7 +2023,7 @@ async function testPendingToolResultResumeAcrossModelSwitch(
     const proxyPort = await modules.startProxy(async () => "test-token");
     const headers = {
       "Content-Type": "application/json",
-      "x-opencode-session-id": "ses-pending-tool",
+      "x-session-id": "ses-pending-tool",
       "x-opencode-agent": "build",
     };
 
