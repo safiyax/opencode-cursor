@@ -319,11 +319,6 @@ export function processServerMessage(
   onUnhandledExec?: (info: UnhandledExecInfo) => void,
 ): void {
   const msgCase = msg.message.case;
-  if (msgCase !== "conversationCheckpointUpdate") {
-    logPluginInfo("Received Cursor server message", {
-      messageCase: msgCase ?? "undefined",
-    });
-  }
 
   if (msgCase === "interactionUpdate") {
     handleInteractionUpdate(
@@ -382,9 +377,10 @@ function handleInteractionUpdate(
 ): void {
   const updateCase = update.message?.case;
   if (
-    updateCase !== "textDelta" &&
-    updateCase !== "thinkingDelta" &&
-    updateCase !== "tokenDelta"
+    updateCase === "partialToolCall" ||
+    updateCase === "toolCallStarted" ||
+    updateCase === "toolCallCompleted" ||
+    updateCase === "turnEnded"
   ) {
     logPluginInfo("Received Cursor interaction update", {
       updateCase: updateCase ?? "undefined",

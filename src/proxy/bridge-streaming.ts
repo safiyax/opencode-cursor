@@ -486,7 +486,7 @@ export async function handleToolResultResume(
           code: "cursor_missing_exec_metadata",
         },
       }),
-      { status: 409, headers: { "Content-Type": "application/json" } },
+      { status: 400, headers: { "Content-Type": "application/json" } },
     );
   }
 
