@@ -13,6 +13,7 @@ import {
   GetBlobResultSchema,
   GrepErrorSchema,
   GrepResultSchema,
+  type InteractionQuery,
   KvClientMessageSchema,
   LsRejectedSchema,
   LsResultSchema,
@@ -46,6 +47,17 @@ export interface UnhandledExecInfo {
   execCase: string;
   execId: string;
   execMsgId: number;
+}
+
+export interface UnsupportedServerMessageInfo {
+  category:
+    | "agentMessage"
+    | "interactionUpdate"
+    | "interactionQuery"
+    | "execServerControl"
+    | "toolCall";
+  caseName: string;
+  detail?: string;
 }
 
 export function parseConnectEndStream(data: Uint8Array): Error | null {
@@ -193,6 +205,7 @@ export function processServerMessage(
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
   onTurnEnded?: () => void,
+  onUnsupportedMessage?: (info: UnsupportedServerMessageInfo) => void,
   onUnhandledExec?: (info: UnhandledExecInfo) => void,
 ): void {
   const msgCase = msg.message.case;
@@ -204,6 +217,7 @@ export function processServerMessage(
       onText,
       onMcpExec,
       onTurnEnded,
+      onUnsupportedMessage,
     );
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
@@ -215,6 +229,16 @@ export function processServerMessage(
       onMcpExec,
       onUnhandledExec,
     );
+  } else if (msgCase === "execServerControlMessage") {
+    onUnsupportedMessage?.({
+      category: "execServerControl",
+      caseName: msg.message.value.message.case ?? "undefined",
+    });
+  } else if (msgCase === "interactionQuery") {
+    onUnsupportedMessage?.({
+      category: "interactionQuery",
+      caseName: (msg.message.value as InteractionQuery).query.case ?? "undefined",
+    });
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
@@ -223,6 +247,11 @@ export function processServerMessage(
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
+  } else {
+    onUnsupportedMessage?.({
+      category: "agentMessage",
+      caseName: msgCase ?? "undefined",
+    });
   }
 }
 
@@ -232,6 +261,7 @@ function handleInteractionUpdate(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onTurnEnded?: () => void,
+  onUnsupportedMessage?: (info: UnsupportedServerMessageInfo) => void,
 ): void {
   const updateCase = update.message?.case;
 
@@ -251,8 +281,33 @@ function handleInteractionUpdate(
   } else if (updateCase === "toolCallCompleted") {
     const exec = decodeInteractionToolCall(update.message.value, state);
     if (exec) onMcpExec(exec);
+    else {
+      onUnsupportedMessage?.({
+        category: "toolCall",
+        caseName: update.message.value?.toolCall?.tool?.case ?? "undefined",
+        detail: "toolCallCompleted",
+      });
+    }
   } else if (updateCase === "turnEnded") {
     onTurnEnded?.();
+  } else if (
+    updateCase === "toolCallStarted" ||
+    updateCase === "toolCallDelta" ||
+    updateCase === "thinkingCompleted" ||
+    updateCase === "userMessageAppended" ||
+    updateCase === "summary" ||
+    updateCase === "summaryStarted" ||
+    updateCase === "summaryCompleted" ||
+    updateCase === "heartbeat" ||
+    updateCase === "stepStarted" ||
+    updateCase === "stepCompleted"
+  ) {
+    return;
+  } else {
+    onUnsupportedMessage?.({
+      category: "interactionUpdate",
+      caseName: updateCase ?? "undefined",
+    });
   }
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec

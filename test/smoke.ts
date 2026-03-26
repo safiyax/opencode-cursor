@@ -28,6 +28,7 @@ type RunSSEMode =
   | "turn-ended-hold"
   | "checkpoint-then-close"
   | "tool-call-pause"
+  | "unsupported-interaction-query-pause"
   | "unsupported-exec-pause"
   | "verbose-title-close";
 
@@ -270,6 +271,32 @@ function makeUnsupportedExecFrame(): Buffer {
     message: {
       case: "execServerMessage",
       value: execMessage,
+    },
+  });
+  return frameConnectUnaryMessage(
+    toBinary(AgentServerMessageSchema, serverMessage),
+  );
+}
+
+function makeUnsupportedInteractionQueryFrame(): Buffer {
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionQuery",
+      value: {
+        id: 9,
+        query: {
+          case: "askQuestionInteractionQuery",
+          value: {
+            toolCallId: "call-question-1",
+            args: {
+              title: "Question",
+              questions: [],
+              runAsync: false,
+              asyncOriginalToolCallId: "",
+            },
+          },
+        },
+      } as any,
     },
   });
   return frameConnectUnaryMessage(
@@ -527,6 +554,11 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           pendingRunSSE
         ) {
           pendingRunSSE.write(makeInteractionToolCallCompletedFrame());
+        } else if (
+          runSSEMode === "unsupported-interaction-query-pause" &&
+          pendingRunSSE
+        ) {
+          pendingRunSSE.write(makeUnsupportedInteractionQueryFrame());
         } else if (runSSEMode === "turn-ended-hold" && pendingRunSSE) {
           pendingRunSSE.write(makeTextDeltaFrame("completed response"));
           pendingRunSSE.write(makeTurnEndedFrame());
@@ -1917,6 +1949,55 @@ async function testUnsupportedExecFailsFast(
   console.log("[test] Unsupported exec fast failure OK");
 }
 
+async function testUnsupportedInteractionQueryFailsFast(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing unsupported interaction query fast failure...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("unsupported-interaction-query-pause");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+    const response = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      },
+    );
+
+    assertEqual(
+      response.status,
+      200,
+      "Expected streaming chat completion headers to be accepted before stream failure",
+    );
+
+    const settled = await Promise.race([
+      response
+        .text()
+        .then(() => "resolved")
+        .catch(() => "rejected"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 1_500)),
+    ]);
+
+    assert(
+      settled !== "timeout",
+      "Expected unsupported interaction query stream to fail fast instead of hanging",
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setRunSSEMode("close-on-append");
+  }
+
+  console.log("[test] Unsupported interaction query fast failure OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -1940,6 +2021,7 @@ async function main() {
     await testSystemPromptForwardedToCursorRunRequest(modules, backend);
     await testPendingToolResultResumeAcrossModelSwitch(modules, backend);
     await testUnsupportedExecFailsFast(modules, backend);
+    await testUnsupportedInteractionQueryFailsFast(modules, backend);
     await testEndStreamStopsHeartbeats(modules, backend);
     await testTurnEndedStopsStreamingResponse(modules, backend);
     await testInteractionToolCallCompletesStreamingResponse(modules, backend);
