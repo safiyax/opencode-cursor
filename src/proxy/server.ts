@@ -1,4 +1,4 @@
-import { errorDetails, logPluginError } from "../logger";
+import { errorDetails, logPluginError, logPluginWarn } from "../logger";
 import type { ChatCompletionRequest } from "../openai/types";
 import { handleChatCompletion } from "./chat-completion";
 import { activeBridges, conversationStates } from "./conversation-state";
@@ -69,10 +69,29 @@ export async function startProxy(
             req.headers.get("x-session-id") ??
             undefined;
           const agentKey = req.headers.get("x-opencode-agent") ?? undefined;
-          return handleChatCompletion(body, accessToken, {
+          const response = await handleChatCompletion(body, accessToken, {
             sessionId,
             agentKey,
           });
+          if (response.status >= 400) {
+            let responseBody = "";
+            try {
+              responseBody = await response.clone().text();
+            } catch (error) {
+              responseBody = `Failed to read rejected response body: ${error instanceof Error ? error.message : String(error)}`;
+            }
+            logPluginWarn("Rejected Cursor chat completion", {
+              path: url.pathname,
+              method: req.method,
+              sessionId,
+              agentKey,
+              status: response.status,
+              requestBody: body,
+              requestBodyText: JSON.stringify(body),
+              responseBody,
+            });
+          }
+          return response;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logPluginError("Cursor proxy request failed", {

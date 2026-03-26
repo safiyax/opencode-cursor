@@ -735,6 +735,69 @@ async function testPluginLogging(modules: TestModules) {
   console.log("[test] OpenCode log forwarding OK");
 }
 
+async function testRejectedChatCompletionLogging(modules: TestModules) {
+  console.log("[test] Testing rejected chat completion logging...");
+
+  const logEntries: any[] = [];
+  modules.configurePluginLogger({
+    directory: "/tmp/opencode-cursor-rejected-log-test",
+    client: {
+      app: {
+        log: async (entry: any) => {
+          logEntries.push(entry);
+          return true;
+        },
+      },
+    },
+  } as any);
+
+  const port = await modules.startProxy(async () => "test-token");
+  try {
+    const response = await fetch(`http://localhost:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "composer-2",
+        stream: false,
+        messages: [{ role: "assistant", content: "partial answer" }],
+      }),
+    });
+
+    assertEqual(
+      response.status,
+      400,
+      "Expected invalid assistant-only request to be rejected",
+    );
+    await modules.flushPluginLogs();
+
+    const rejectedLog = logEntries.find(
+      (entry) => entry?.body?.message === "Rejected Cursor chat completion",
+    );
+    assert(rejectedLog, "Expected rejected chat completion log entry");
+    assertEqual(
+      rejectedLog?.body?.extra?.status,
+      400,
+      "Expected rejected request log to include status",
+    );
+    assert(
+      String(rejectedLog?.body?.extra?.requestBodyText).includes(
+        "partial answer",
+      ),
+      `Expected rejected request log to include raw request body, got ${JSON.stringify(rejectedLog)}`,
+    );
+    assert(
+      String(rejectedLog?.body?.extra?.responseBody).includes(
+        "No user message found",
+      ),
+      `Expected rejected request log to include raw response body, got ${JSON.stringify(rejectedLog)}`,
+    );
+  } finally {
+    modules.stopProxy();
+  }
+
+  console.log("[test] Rejected chat completion logging OK");
+}
+
 async function testHttp2UnaryRpc(modules: TestModules) {
   console.log("[test] Testing HTTP/2 unary discovery transport...");
 
@@ -1721,12 +1784,12 @@ async function testPlainTextProviderSwitchHandoff(
   console.log("[test] Plain-text provider-switch handoff OK");
 }
 
-async function testAssistantLastContinuationWithoutCheckpointFails(
+async function testAssistantLastContinuationWithoutCheckpointUsesGenericHandling(
   modules: TestModules,
   backend: TestCursorBackend,
 ) {
   console.log(
-    "[test] Testing assistant-last continuation failure without checkpoint...",
+    "[test] Testing assistant-last continuation generic handling without checkpoint...",
   );
 
   try {
@@ -1756,35 +1819,40 @@ async function testAssistantLastContinuationWithoutCheckpointFails(
 
     assertEqual(
       response.status,
-      400,
-      "Expected assistant-last continuation without checkpoint to fail",
+      200,
+      "Expected assistant-last continuation without checkpoint to use generic request handling",
     );
-    const body = (await response.json()) as { error?: { message?: string } };
+    await response.json();
     const observed = backend.getObservedRunRequests();
     assertEqual(
-      body.error?.message,
-      "Assistant-last continuation is not supported by the Cursor provider",
-      "Expected explicit assistant-last continuation error",
-    );
-    assertEqual(
       observed.length,
-      0,
-      "Expected no Cursor run request for unsupported assistant-last continuation",
+      1,
+      "Expected assistant-last continuation to produce one Cursor run request",
+    );
+    assert(
+      observed[0]?.latestUserText.includes("Please try out all the tools."),
+      `Expected request to include the user message, got ${JSON.stringify(observed[0])}`,
+    );
+    assert(
+      observed[0]?.latestUserText.includes(
+        "Demonstrating each available tool with minimal, safe invocations.",
+      ),
+      `Expected request to include the pending assistant content, got ${JSON.stringify(observed[0])}`,
     );
   } finally {
     modules.stopProxy();
   }
 
   console.log(
-    "[test] Assistant-last continuation failure without checkpoint OK",
+    "[test] Assistant-last continuation generic handling without checkpoint OK",
   );
 }
 
-async function testAssistantLastContinuationWithCheckpointFails(
+async function testAssistantLastContinuationWithCheckpointUsesGenericHandling(
   modules: TestModules,
   backend: TestCursorBackend,
 ) {
-  console.log("[test] Testing assistant-last continuation failure with checkpoint...");
+  console.log("[test] Testing assistant-last continuation generic handling with checkpoint...");
 
   try {
     backend.resetObservations();
@@ -1834,30 +1902,29 @@ async function testAssistantLastContinuationWithCheckpointFails(
     );
     assertEqual(
       secondResponse.status,
-      400,
-      "Expected assistant-last continuation with checkpoint to fail",
+      200,
+      "Expected assistant-last continuation with checkpoint to use generic request handling",
     );
-    const body = (await secondResponse.json()) as {
-      error?: { message?: string };
-    };
+    await secondResponse.json();
 
     const observed = backend.getObservedRunRequests();
     assertEqual(
-      body.error?.message,
-      "Assistant-last continuation is not supported by the Cursor provider",
-      "Expected explicit assistant-last continuation error even with checkpoint",
-    );
-    assertEqual(
       observed.length,
-      0,
-      "Expected no Cursor run request when assistant-last continuation is rejected",
+      1,
+      "Expected assistant-last continuation with checkpoint to produce one Cursor run request",
+    );
+    assert(
+      observed[0]?.latestUserText.includes(
+        "Demonstrating each available tool with minimal, safe invocations.",
+      ),
+      `Expected resumed generic request to include the pending assistant content, got ${JSON.stringify(observed[0])}`,
     );
   } finally {
     modules.stopProxy();
     backend.setRunSSEMode("close-on-append");
   }
 
-  console.log("[test] Assistant-last continuation failure with checkpoint OK");
+  console.log("[test] Assistant-last continuation generic handling with checkpoint OK");
 }
 
 async function testSystemPromptForwardedToCursorRunRequest(
@@ -2152,6 +2219,7 @@ async function main() {
     await testTokenExpiry(modules);
     await testPluginShape(modules);
     await testPluginLogging(modules);
+    await testRejectedChatCompletionLogging(modules);
     await testHttp2UnaryRpc(modules);
     await testArrayContentParsing(modules);
     await testSessionHeadersPreserveConversationState(modules, backend);
@@ -2159,11 +2227,14 @@ async function main() {
     await testModelSwitchPreservesConversationState(modules, backend);
     await testProviderSwitchHistoryReconstruction(modules, backend);
     await testPlainTextProviderSwitchHandoff(modules, backend);
-    await testAssistantLastContinuationWithoutCheckpointFails(
+    await testAssistantLastContinuationWithoutCheckpointUsesGenericHandling(
       modules,
       backend,
     );
-    await testAssistantLastContinuationWithCheckpointFails(modules, backend);
+    await testAssistantLastContinuationWithCheckpointUsesGenericHandling(
+      modules,
+      backend,
+    );
     await testSystemPromptForwardedToCursorRunRequest(modules, backend);
     await testPendingToolResultResumeAcrossModelSwitch(modules, backend);
     await testUnsupportedExecFailsFast(modules, backend);

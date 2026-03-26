@@ -43,7 +43,6 @@ export function handleChatCompletion(
     toolResults,
     pendingAssistantSummary,
     completedTurnsFingerprint,
-    assistantContinuation,
   } = parsed;
   const modelId = body.model;
   const normalizedAgentKey = normalizeAgentKey(context.agentKey);
@@ -162,25 +161,13 @@ export function handleChatCompletion(
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 
-  if (assistantContinuation) {
-    return new Response(
-      JSON.stringify({
-        error: {
-          message:
-            "Assistant-last continuation is not supported by the Cursor provider",
-          type: "invalid_request_error",
-        },
-      }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
-  }
-
   // Build the request. When tool results are present but the bridge died,
   // we must still include the last user text so Cursor has context.
   const mcpTools = buildMcpToolDefinitions(tools);
+  const hasPendingAssistantSummary = pendingAssistantSummary.trim().length > 0;
   const needsInitialHandoff =
     !stored.checkpoint &&
-    (turns.length > 0 || pendingAssistantSummary || toolResults.length > 0);
+    (turns.length > 0 || hasPendingAssistantSummary || toolResults.length > 0);
   const replayTurns = needsInitialHandoff ? [] : turns;
   let effectiveUserText = needsInitialHandoff
     ? buildInitialHandoffPrompt(
@@ -189,7 +176,7 @@ export function handleChatCompletion(
         pendingAssistantSummary,
         toolResults,
       )
-    : toolResults.length > 0
+    : toolResults.length > 0 || hasPendingAssistantSummary
       ? buildToolResumePrompt(userText, pendingAssistantSummary, toolResults)
       : userText;
   const payload = buildCursorRequest(
