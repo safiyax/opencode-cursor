@@ -90,6 +90,18 @@ function createBridgeStreamResponse(
         if (closed) return;
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       };
+      const failStream = (message: string, code?: string) => {
+        if (closed) return;
+        sendSSE({
+          error: {
+            message,
+            type: "server_error",
+            ...(code ? { code } : {}),
+          },
+        });
+        sendDone();
+        closeController();
+      };
       const closeController = () => {
         if (closed) return;
         closed = true;
@@ -277,10 +289,7 @@ function createBridgeStreamResponse(
 
         if (endStreamError) {
           activeBridges.delete(bridgeKey);
-          if (!closed) {
-            closed = true;
-            controller.error(endStreamError);
-          }
+          failStream(endStreamError.message, "cursor_bridge_closed");
           return;
         }
 
@@ -307,11 +316,7 @@ function createBridgeStreamResponse(
 
         activeBridges.delete(bridgeKey);
         if (code !== 0 && !closed) {
-          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
+          failStream("Cursor bridge connection lost", "cursor_bridge_closed");
         }
       });
     },

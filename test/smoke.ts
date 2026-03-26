@@ -25,6 +25,7 @@ type RunSSEMode =
   | "close-on-append"
   | "end-stream-hold"
   | "interaction-tool-call-pause"
+  | "interaction-native-tool-complete"
   | "turn-ended-hold"
   | "checkpoint-then-close"
   | "tool-call-pause"
@@ -251,6 +252,34 @@ function makeInteractionToolCallCompletedFrame(): Buffer {
                       ),
                     },
                   },
+                },
+              },
+            },
+          },
+        },
+      } as any,
+    },
+  });
+  return frameConnectUnaryMessage(
+    toBinary(AgentServerMessageSchema, serverMessage),
+  );
+}
+
+function makeInteractionNativeToolCallCompletedFrame(): Buffer {
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: {
+        message: {
+          case: "toolCallCompleted",
+          value: {
+            callId: "native-call-1",
+            modelCallId: "native-model-call-1",
+            toolCall: {
+              tool: {
+                case: "globToolCall",
+                value: {
+                  args: new Uint8Array(),
                 },
               },
             },
@@ -556,6 +585,13 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           pendingRunSSE
         ) {
           pendingRunSSE.write(makeInteractionToolCallCompletedFrame());
+        } else if (
+          runSSEMode === "interaction-native-tool-complete" &&
+          pendingRunSSE
+        ) {
+          pendingRunSSE.write(makeTextDeltaFrame("native tool update ignored"));
+          pendingRunSSE.write(makeInteractionNativeToolCallCompletedFrame());
+          pendingRunSSE.write(makeTurnEndedFrame());
         } else if (
           runSSEMode === "unsupported-interaction-query-pause" &&
           pendingRunSSE
@@ -1383,6 +1419,62 @@ async function testInteractionToolCallCompletesStreamingResponse(
   console.log("[test] Interaction-update MCP tool call handling OK");
 }
 
+async function testNativeInteractionToolCallCompletedDoesNotAbort(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing native interaction tool completion is ignored...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("interaction-native-tool-complete");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+    const response = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-session-id": "ses-native-tool" },
+        body: JSON.stringify({
+          model: "composer-2",
+          messages: [{ role: "user", content: "look around the repo" }],
+        }),
+      },
+    );
+
+    assertEqual(
+      response.status,
+      200,
+      "Expected streaming chat completion with native interaction tool completion to succeed",
+    );
+    const body = await response.text();
+    assert(
+      body.includes("native tool update ignored"),
+      `Expected streamed text to survive native tool completion update, got ${JSON.stringify(body)}`,
+    );
+    assert(
+      body.includes('"finish_reason":"stop"'),
+      `Expected stream to complete normally after native tool completion update, got ${JSON.stringify(body)}`,
+    );
+    assert(
+      body.includes("data: [DONE]"),
+      `Expected native tool completion update flow to terminate cleanly, got ${JSON.stringify(body)}`,
+    );
+
+    const observed = backend.getObservedRunRequests();
+    assertEqual(
+      observed.length,
+      1,
+      "Expected native interaction tool completion update not to trigger a retry request",
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setRunSSEMode("close-on-append");
+  }
+
+  console.log("[test] Native interaction tool completion ignore OK");
+}
+
 async function testSessionHeadersPreserveConversationState(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -2138,16 +2230,22 @@ async function testUnsupportedExecFailsFast(
     );
 
     const settled = await Promise.race([
-      response
-        .text()
-        .then(() => "resolved")
-        .catch(() => "rejected"),
-      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 1_500)),
+      response.text().then((body) => ({ kind: "resolved", body })),
+      new Promise<{ kind: "timeout" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "timeout" }), 1_500),
+      ),
     ]);
 
     assert(
-      settled !== "timeout",
+      settled.kind !== "timeout",
       "Expected unsupported exec stream to fail fast instead of hanging",
+    );
+    assert(
+      settled.kind === "resolved" &&
+        settled.body.includes(
+          '"error":{"message":"Cursor requested unsupported exec type: undefined"',
+        ),
+      `Expected unsupported exec stream to surface an explicit SSE error, got ${JSON.stringify(settled)}`,
     );
   } finally {
     modules.stopProxy();
@@ -2187,16 +2285,22 @@ async function testUnsupportedInteractionQueryFailsFast(
     );
 
     const settled = await Promise.race([
-      response
-        .text()
-        .then(() => "resolved")
-        .catch(() => "rejected"),
-      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 1_500)),
+      response.text().then((body) => ({ kind: "resolved", body })),
+      new Promise<{ kind: "timeout" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "timeout" }), 1_500),
+      ),
     ]);
 
     assert(
-      settled !== "timeout",
+      settled.kind !== "timeout",
       "Expected unsupported interaction query stream to fail fast instead of hanging",
+    );
+    assert(
+      settled.kind === "resolved" &&
+        settled.body.includes(
+          '"error":{"message":"Cursor returned unsupported interactionQuery: askQuestionInteractionQuery"',
+        ),
+      `Expected unsupported interaction query stream to surface an explicit SSE error, got ${JSON.stringify(settled)}`,
     );
   } finally {
     modules.stopProxy();
@@ -2242,6 +2346,7 @@ async function main() {
     await testEndStreamStopsHeartbeats(modules, backend);
     await testTurnEndedStopsStreamingResponse(modules, backend);
     await testInteractionToolCallCompletesStreamingResponse(modules, backend);
+    await testNativeInteractionToolCallCompletedDoesNotAbort(modules, backend);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFailureAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");

@@ -281,13 +281,6 @@ function handleInteractionUpdate(
   } else if (updateCase === "toolCallCompleted") {
     const exec = decodeInteractionToolCall(update.message.value, state);
     if (exec) onMcpExec(exec);
-    else {
-      onUnsupportedMessage?.({
-        category: "toolCall",
-        caseName: update.message.value?.toolCall?.tool?.case ?? "undefined",
-        detail: "toolCallCompleted",
-      });
-    }
   } else if (updateCase === "turnEnded") {
     onTurnEnded?.();
   } else if (
@@ -309,9 +302,10 @@ function handleInteractionUpdate(
       caseName: updateCase ?? "undefined",
     });
   }
-  // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
-  // are intentionally ignored. MCP tool calls flow through the exec
-  // message path (mcpArgs → mcpResult), not interaction updates.
+  // toolCallStarted, partialToolCall, toolCallDelta, and non-MCP
+  // toolCallCompleted updates are informational only. Actionable MCP tool
+  // calls may still appear here on some models, so we surface those, but we
+  // do not abort the bridge for native Cursor tool-call progress events.
 }
 
 function decodeInteractionToolCall(
