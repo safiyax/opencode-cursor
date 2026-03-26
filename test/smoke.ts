@@ -1188,29 +1188,93 @@ async function testProviderSwitchHistoryReconstruction(
     assertEqual(response.status, 200, "Expected reconstructed provider-switch request to succeed");
     const observed = backend.getObservedRunRequests();
     assertEqual(observed.length, 1, "Expected one observed Cursor run request");
-    assertEqual(observed[0]?.turnCount, 1, "Expected one reconstructed historical turn");
     assertEqual(
-      observed[0]?.latestUserText,
-      "switch this session to cursor",
-      "Expected latest user text to remain the follow-up prompt",
+      observed[0]?.turnCount,
+      0,
+      "Expected first Cursor handoff request to flatten prior history into the latest prompt instead of relying on Cursor replay turns",
     );
     assert(
-      observed[0]?.turns[0]?.assistantText.includes("[assistant requested tool read_file id=call-read-1]"),
+      observed[0]?.latestUserText.includes("[OpenCode session handoff]"),
+      `Expected latest user text to include a handoff transcript, got ${JSON.stringify(observed[0])}`,
+    );
+    assert(
+      observed[0]?.latestUserText.includes("User: inspect the config"),
+      `Expected latest user text to include the prior user prompt, got ${JSON.stringify(observed[0])}`,
+    );
+    assert(
+      observed[0]?.latestUserText.includes("Assistant: I will inspect the config file."),
+      `Expected latest user text to include the prior assistant reply, got ${JSON.stringify(observed[0])}`,
+    );
+    assert(
+      observed[0]?.latestUserText.includes("[assistant requested tool read_file id=call-read-1]"),
       `Expected reconstructed assistant history to include the prior tool call, got ${JSON.stringify(observed[0])}`,
     );
     assert(
-      observed[0]?.turns[0]?.assistantText.includes('[tool result id=call-read-1]'),
+      observed[0]?.latestUserText.includes('[tool result id=call-read-1]'),
       `Expected reconstructed assistant history to include the prior tool result, got ${JSON.stringify(observed[0])}`,
     );
     assert(
-      observed[0]?.turns[0]?.assistantText.includes("The config currently uses an Anthropic model."),
+      observed[0]?.latestUserText.includes("The config currently uses an Anthropic model."),
       `Expected reconstructed assistant history to preserve the prior assistant reply, got ${JSON.stringify(observed[0])}`,
+    );
+    assert(
+      observed[0]?.latestUserText.includes("Latest user message:\nswitch this session to cursor"),
+      `Expected latest user message to remain present at the end of the handoff prompt, got ${JSON.stringify(observed[0])}`,
     );
   } finally {
     modules.stopProxy();
   }
 
   console.log("[test] Provider-switch history reconstruction OK");
+}
+
+async function testPlainTextProviderSwitchHandoff(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing plain-text provider-switch handoff...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("close-on-append");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+
+    const response = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "composer-2",
+        stream: false,
+        messages: [
+          { role: "user", content: "Respond with Hi" },
+          { role: "assistant", content: "Hi" },
+          { role: "user", content: "What was the first prompt in this session?" },
+        ],
+      }),
+    });
+
+    assertEqual(response.status, 200, "Expected plain-text handoff request to succeed");
+    const observed = backend.getObservedRunRequests();
+    assertEqual(observed.length, 1, "Expected one observed Cursor run request");
+    assertEqual(observed[0]?.turnCount, 0, "Expected plain-text handoff to flatten prior turns into the latest prompt");
+    assert(
+      observed[0]?.latestUserText.includes("User: Respond with Hi"),
+      `Expected handoff prompt to include the first user message, got ${JSON.stringify(observed[0])}`,
+    );
+    assert(
+      observed[0]?.latestUserText.includes("Assistant: Hi"),
+      `Expected handoff prompt to include the prior assistant reply, got ${JSON.stringify(observed[0])}`,
+    );
+    assert(
+      observed[0]?.latestUserText.includes("Latest user message:\nWhat was the first prompt in this session?"),
+      `Expected handoff prompt to end with the latest user message, got ${JSON.stringify(observed[0])}`,
+    );
+  } finally {
+    modules.stopProxy();
+  }
+
+  console.log("[test] Plain-text provider-switch handoff OK");
 }
 
 async function testPendingToolResultResumeAcrossModelSwitch(
@@ -1314,6 +1378,7 @@ async function main() {
     await testAgentScopedSessionIsolation(modules, backend);
     await testModelSwitchPreservesConversationState(modules, backend);
     await testProviderSwitchHistoryReconstruction(modules, backend);
+    await testPlainTextProviderSwitchHandoff(modules, backend);
     await testPendingToolResultResumeAcrossModelSwitch(modules, backend);
     await testEndStreamStopsHeartbeats(modules, backend);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);

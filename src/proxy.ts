@@ -878,11 +878,15 @@ function handleChatCompletion(
   // Build the request. When tool results are present but the bridge died,
   // we must still include the last user text so Cursor has context.
   const mcpTools = buildMcpToolDefinitions(tools);
-  const effectiveUserText = toolResults.length > 0
-    ? buildToolResumePrompt(userText, pendingAssistantSummary, toolResults)
-    : userText;
+  const needsInitialHandoff = !stored.checkpoint && (turns.length > 0 || pendingAssistantSummary || toolResults.length > 0);
+  const replayTurns = needsInitialHandoff ? [] : turns;
+  const effectiveUserText = needsInitialHandoff
+    ? buildInitialHandoffPrompt(userText, turns, pendingAssistantSummary, toolResults)
+    : toolResults.length > 0
+      ? buildToolResumePrompt(userText, pendingAssistantSummary, toolResults)
+      : userText;
   const payload = buildCursorRequest(
-    modelId, systemPrompt, effectiveUserText, turns,
+    modelId, systemPrompt, effectiveUserText, replayTurns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
   );
   payload.mcpTools = mcpTools;
@@ -1118,6 +1122,41 @@ function buildToolResumePrompt(
     parts.push(toolResults.map(formatToolResultSummary).join("\n\n"));
   }
   return parts.filter(Boolean).join("\n\n");
+}
+
+function buildInitialHandoffPrompt(
+  userText: string,
+  turns: Array<{ userText: string; assistantText: string }>,
+  pendingAssistantSummary: string,
+  toolResults: ToolResultInfo[],
+): string {
+  const transcript = turns.map((turn, index) => {
+    const sections = [`Turn ${index + 1}`];
+    if (turn.userText.trim()) sections.push(`User: ${turn.userText.trim()}`);
+    if (turn.assistantText.trim()) sections.push(`Assistant: ${turn.assistantText.trim()}`);
+    return sections.join("\n");
+  });
+
+  const inProgress = buildToolResumePrompt("", pendingAssistantSummary, toolResults).trim();
+  const history = [
+    ...transcript,
+    ...(inProgress ? [`In-progress turn\n${inProgress}`] : []),
+  ].join("\n\n").trim();
+
+  if (!history) return userText;
+
+  return [
+    "[OpenCode session handoff]",
+    "You are continuing an existing session that previously ran on another provider/model.",
+    "Treat the transcript below as prior conversation history before answering the latest user message.",
+    "",
+    "<previous-session-transcript>",
+    history,
+    "</previous-session-transcript>",
+    "",
+    "Latest user message:",
+    userText.trim(),
+  ].filter(Boolean).join("\n");
 }
 
 function selectToolsForChoice(
