@@ -180,6 +180,9 @@ export const CursorAuthPlugin: Plugin = async (
 
       output.headers["x-opencode-session-id"] = incoming.sessionID;
       output.headers["x-session-id"] = incoming.sessionID;
+      if (incoming.agent) {
+        output.headers["x-opencode-agent"] = incoming.agent;
+      }
     },
   };
 };

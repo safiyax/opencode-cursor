@@ -1,7 +1,8 @@
 import http from "node:http";
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, fromJson, toBinary } from "@bufbuild/protobuf";
+import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
   AgentClientMessageSchema,
   AgentConversationTurnStructureSchema,
@@ -10,18 +11,21 @@ import {
   ConversationStateStructureSchema,
   ConversationStepSchema,
   ConversationTurnStructureSchema,
+  ExecServerMessageSchema,
   GetUsableModelsResponseSchema,
+  McpArgsSchema,
   ModelDetailsSchema,
   UserMessageSchema,
 } from "../src/proto/agent_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
-type RunSSEMode = "close-on-append" | "end-stream-hold" | "checkpoint-then-close";
+type RunSSEMode = "close-on-append" | "end-stream-hold" | "checkpoint-then-close" | "tool-call-pause";
 
 interface ObservedRunRequest {
   conversationId: string;
   turnCount: number;
   latestUserText: string;
+  turns: Array<{ userText: string; assistantText: string }>;
 }
 
 interface TestModules {
@@ -132,13 +136,61 @@ function decodeObservedRunRequest(payload: Uint8Array): ObservedRunRequest | nul
 
   const runRequest = clientMessage.message.value;
   const action = runRequest.action?.action;
+  const turns = (runRequest.conversationState?.turns ?? []).map((turnBytes) => {
+    const turnStructure = fromBinary(ConversationTurnStructureSchema, turnBytes);
+    const agentTurn = turnStructure.turn.case === "agentConversationTurn"
+      ? turnStructure.turn.value
+      : undefined;
+    const userText = agentTurn?.userMessage
+      ? fromBinary(UserMessageSchema, agentTurn.userMessage).text
+      : "";
+    const assistantText = (agentTurn?.steps ?? [])
+      .map((stepBytes) => {
+        const step = fromBinary(ConversationStepSchema, stepBytes);
+        return step.message.case === "assistantMessage"
+          ? step.message.value.text
+          : "";
+      })
+      .filter(Boolean)
+      .join("\n");
+
+    return { userText, assistantText };
+  });
+
   return {
     conversationId: runRequest.conversationId ?? "",
     turnCount: runRequest.conversationState?.turns.length ?? 0,
     latestUserText: action?.case === "userMessageAction"
       ? action.value.userMessage?.text ?? ""
       : "",
+    turns,
   };
+}
+
+function makeToolCallFrame(): Buffer {
+  const execMessage = create(ExecServerMessageSchema, {
+    id: 1,
+    execId: "exec-1",
+    message: {
+      case: "mcpArgs",
+      value: create(McpArgsSchema, {
+        name: "read_file",
+        toolName: "read_file",
+        toolCallId: "call-1",
+        providerIdentifier: "opencode",
+        args: {
+          path: toBinary(ValueSchema, fromJson(ValueSchema, "src/index.ts")),
+        },
+      }),
+    },
+  });
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: {
+      case: "execServerMessage",
+      value: execMessage,
+    },
+  });
+  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
 }
 
 function makeCheckpointUpdateFrame(): Buffer {
@@ -224,6 +276,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
   const refreshPort = (refreshServer.address() as AddressInfo).port;
 
   let pendingRunSSE: http.ServerResponse | null = null;
+  let toolCallIssued = false;
 
   const apiServer = http.createServer((req, res) => {
     const path = req.url ?? "";
@@ -306,6 +359,15 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           pendingRunSSE.write(makeCheckpointUpdateFrame());
           pendingRunSSE.end();
           pendingRunSSE = null;
+        } else if (runSSEMode === "tool-call-pause" && pendingRunSSE) {
+          if (!toolCallIssued) {
+            toolCallIssued = true;
+            pendingRunSSE.write(makeToolCallFrame());
+          } else {
+            pendingRunSSE.end();
+            pendingRunSSE = null;
+            toolCallIssued = false;
+          }
         }
         return;
       }
@@ -335,6 +397,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       refreshAuthHeaders.length = 0;
       observedRunRequests.length = 0;
       bidiAppendCount = 0;
+      toolCallIssued = false;
     },
     getDiscoveryAuthHeaders() {
       return [...discoveryAuthHeaders];
@@ -349,7 +412,10 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       return bidiAppendCount;
     },
     getObservedRunRequests() {
-      return observedRunRequests.map((request) => ({ ...request }));
+      return observedRunRequests.map((request) => ({
+        ...request,
+        turns: request.turns.map((turn) => ({ ...turn })),
+      }));
     },
     async close() {
       await Promise.all([
@@ -940,6 +1006,295 @@ async function testSessionHeadersPreserveConversationState(
   console.log("[test] Session header conversation reuse OK");
 }
 
+async function testAgentScopedSessionIsolation(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing agent-scoped session isolation...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("checkpoint-then-close");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+    const buildHeaders = {
+      "Content-Type": "application/json",
+      "x-opencode-session-id": "ses-agent-shared",
+      "x-opencode-agent": "build",
+    };
+    const titleHeaders = {
+      "Content-Type": "application/json",
+      "x-opencode-session-id": "ses-agent-shared",
+      "x-opencode-agent": "title",
+    };
+
+    await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: buildHeaders,
+      body: JSON.stringify({
+        model: "composer-2",
+        messages: [{ role: "user", content: "debug the plugin" }],
+      }),
+    }).then((response) => response.text());
+
+    await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: titleHeaders,
+      body: JSON.stringify({
+        model: "composer-2",
+        messages: [{ role: "user", content: "generate a short title" }],
+      }),
+    }).then((response) => response.text());
+
+    await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: buildHeaders,
+      body: JSON.stringify({
+        model: "composer-2",
+        messages: [{ role: "user", content: "continue the debugging" }],
+      }),
+    }).then((response) => response.text());
+
+    const observed = backend.getObservedRunRequests();
+    assertEqual(observed.length, 3, "Expected three observed run requests");
+    assert(
+      observed[0]?.conversationId !== observed[1]?.conversationId,
+      "Expected title agent request to use a different Cursor conversation id",
+    );
+    assertEqual(
+      observed[1]?.turnCount,
+      0,
+      "Expected title agent request to start with a fresh conversation state",
+    );
+    assertEqual(
+      observed[2]?.conversationId,
+      observed[0]?.conversationId,
+      "Expected build agent requests to keep sharing the same Cursor conversation id",
+    );
+    assertEqual(
+      observed[2]?.turnCount,
+      1,
+      "Expected build agent follow-up to reuse its checkpointed conversation state",
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setRunSSEMode("close-on-append");
+  }
+
+  console.log("[test] Agent-scoped session isolation OK");
+}
+
+async function testModelSwitchPreservesConversationState(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing model switch conversation reuse...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("checkpoint-then-close");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+    const headers = {
+      "Content-Type": "application/json",
+      "x-opencode-session-id": "ses-model-shared",
+      "x-opencode-agent": "build",
+    };
+
+    await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "composer-2",
+        messages: [{ role: "user", content: "first model prompt" }],
+      }),
+    }).then((response) => response.text());
+
+    await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "composer-2-fast",
+        messages: [{ role: "user", content: "follow up on the faster model" }],
+      }),
+    }).then((response) => response.text());
+
+    const observed = backend.getObservedRunRequests();
+    assertEqual(observed.length, 2, "Expected two observed Cursor run requests");
+    assertEqual(
+      observed[1]?.conversationId,
+      observed[0]?.conversationId,
+      "Expected model switch to preserve Cursor conversation id within the same session",
+    );
+    assertEqual(
+      observed[1]?.turnCount,
+      1,
+      "Expected model switch follow-up to reuse checkpointed conversation turns",
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setRunSSEMode("close-on-append");
+  }
+
+  console.log("[test] Model switch conversation reuse OK");
+}
+
+async function testProviderSwitchHistoryReconstruction(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing provider-switch history reconstruction...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("close-on-append");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+
+    const response = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "composer-2",
+        stream: false,
+        messages: [
+          { role: "system", content: "You are a helpful assistant." },
+          { role: "user", content: "inspect the config" },
+          {
+            role: "assistant",
+            content: "I will inspect the config file.",
+            tool_calls: [
+              {
+                id: "call-read-1",
+                type: "function",
+                function: {
+                  name: "read_file",
+                  arguments: JSON.stringify({ path: "opencode.json" }),
+                },
+              },
+            ],
+          },
+          {
+            role: "tool",
+            tool_call_id: "call-read-1",
+            content: '{"model":"anthropic/claude-sonnet-4-5"}',
+          },
+          { role: "assistant", content: "The config currently uses an Anthropic model." },
+          { role: "user", content: "switch this session to cursor" },
+        ],
+      }),
+    });
+
+    assertEqual(response.status, 200, "Expected reconstructed provider-switch request to succeed");
+    const observed = backend.getObservedRunRequests();
+    assertEqual(observed.length, 1, "Expected one observed Cursor run request");
+    assertEqual(observed[0]?.turnCount, 1, "Expected one reconstructed historical turn");
+    assertEqual(
+      observed[0]?.latestUserText,
+      "switch this session to cursor",
+      "Expected latest user text to remain the follow-up prompt",
+    );
+    assert(
+      observed[0]?.turns[0]?.assistantText.includes("[assistant requested tool read_file id=call-read-1]"),
+      `Expected reconstructed assistant history to include the prior tool call, got ${JSON.stringify(observed[0])}`,
+    );
+    assert(
+      observed[0]?.turns[0]?.assistantText.includes('[tool result id=call-read-1]'),
+      `Expected reconstructed assistant history to include the prior tool result, got ${JSON.stringify(observed[0])}`,
+    );
+    assert(
+      observed[0]?.turns[0]?.assistantText.includes("The config currently uses an Anthropic model."),
+      `Expected reconstructed assistant history to preserve the prior assistant reply, got ${JSON.stringify(observed[0])}`,
+    );
+  } finally {
+    modules.stopProxy();
+  }
+
+  console.log("[test] Provider-switch history reconstruction OK");
+}
+
+async function testPendingToolResultResumeAcrossModelSwitch(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing pending tool result resume across model switch...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("tool-call-pause");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+    const headers = {
+      "Content-Type": "application/json",
+      "x-opencode-session-id": "ses-pending-tool",
+      "x-opencode-agent": "build",
+    };
+
+    const firstResponse = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "composer-2",
+        messages: [{ role: "user", content: "use a tool to inspect the file" }],
+      }),
+    });
+    assertEqual(firstResponse.status, 200, "Expected initial tool-call request to succeed");
+    const firstBody = await firstResponse.text();
+    assert(
+      firstBody.includes('"finish_reason":"tool_calls"'),
+      `Expected initial response to pause for tool calls, got ${JSON.stringify(firstBody)}`,
+    );
+
+    const secondResponse = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "composer-2-fast",
+        messages: [
+          { role: "user", content: "use a tool to inspect the file" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call-1",
+                type: "function",
+                function: {
+                  name: "read_file",
+                  arguments: JSON.stringify({ path: "src/index.ts" }),
+                },
+              },
+            ],
+          },
+          {
+            role: "tool",
+            tool_call_id: "call-1",
+            content: "file contents",
+          },
+        ],
+      }),
+    });
+    assertEqual(secondResponse.status, 200, "Expected resumed request to succeed after model switch");
+    const secondBody = await secondResponse.text();
+    assert(
+      secondBody.includes("data: [DONE]"),
+      `Expected resumed stream to terminate cleanly, got ${JSON.stringify(secondBody)}`,
+    );
+
+    const observed = backend.getObservedRunRequests();
+    assertEqual(
+      observed.length,
+      1,
+      "Expected tool result continuation to resume the existing Cursor bridge instead of starting a new run request",
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setRunSSEMode("close-on-append");
+  }
+
+  console.log("[test] Pending tool result resume across model switch OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -956,6 +1311,10 @@ async function main() {
     await testHttp2UnaryRpc(modules);
     await testArrayContentParsing(modules);
     await testSessionHeadersPreserveConversationState(modules, backend);
+    await testAgentScopedSessionIsolation(modules, backend);
+    await testModelSwitchPreservesConversationState(modules, backend);
+    await testProviderSwitchHistoryReconstruction(modules, backend);
+    await testPendingToolResultResumeAcrossModelSwitch(modules, backend);
     await testEndStreamStopsHeartbeats(modules, backend);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFailureAndSuccess(modules, backend);

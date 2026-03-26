@@ -114,12 +114,14 @@ interface ChatCompletionRequest {
   stream?: boolean;
   temperature?: number;
   max_tokens?: number;
+  max_completion_tokens?: number;
   tools?: OpenAIToolDef[];
   tool_choice?: unknown;
 }
 
 interface ChatRequestContext {
   sessionId?: string;
+  agentKey?: string;
 }
 
 
@@ -146,6 +148,8 @@ interface ActiveBridge {
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   pendingExecs: PendingExec[];
+  modelId: string;
+  metadata: ConversationRequestMetadata;
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
@@ -158,6 +162,8 @@ interface StoredConversation {
   checkpoint: Uint8Array | null;
   blobStore: Map<string, Uint8Array>;
   lastAccessMs: number;
+  systemPromptHash: string;
+  completedTurnsFingerprint: string;
 }
 
 const conversationStates = new Map<string, StoredConversation>();
@@ -170,6 +176,35 @@ function evictStaleConversations(): void {
       conversationStates.delete(key);
     }
   }
+}
+
+function normalizeAgentKey(agentKey?: string): string {
+  const trimmed = agentKey?.trim();
+  return trimmed ? trimmed : "default";
+}
+
+function hashString(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function createStoredConversation(): StoredConversation {
+  return {
+    conversationId: crypto.randomUUID(),
+    checkpoint: null,
+    blobStore: new Map(),
+    lastAccessMs: Date.now(),
+    systemPromptHash: "",
+    completedTurnsFingerprint: "",
+  };
+}
+
+function resetStoredConversation(stored: StoredConversation): void {
+  stored.conversationId = crypto.randomUUID();
+  stored.checkpoint = null;
+  stored.blobStore = new Map();
+  stored.lastAccessMs = Date.now();
+  stored.systemPromptHash = "";
+  stored.completedTurnsFingerprint = "";
 }
 
 /** Connect protocol frame: [1-byte flags][4-byte BE length][payload] */
@@ -710,7 +745,8 @@ export async function startProxy(
           const sessionId = req.headers.get("x-opencode-session-id")
             ?? req.headers.get("x-session-id")
             ?? undefined;
-          return handleChatCompletion(body, accessToken, { sessionId });
+          const agentKey = req.headers.get("x-opencode-agent") ?? undefined;
+          return handleChatCompletion(body, accessToken, { sessionId, agentKey });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           logPluginError("Cursor proxy request failed", {
@@ -758,9 +794,17 @@ function handleChatCompletion(
   accessToken: string,
   context: ChatRequestContext = {},
 ): Response | Promise<Response> {
-  const { systemPrompt, userText, turns, toolResults } = parseMessages(body.messages);
+  const parsed = parseMessages(body.messages);
+  const {
+    systemPrompt,
+    userText,
+    turns,
+    toolResults,
+    pendingAssistantSummary,
+    completedTurnsFingerprint,
+  } = parsed;
   const modelId = body.model;
-  const tools = body.tools ?? [];
+  const tools = selectToolsForChoice(body.tools ?? [], body.tool_choice);
 
   if (!userText && toolResults.length === 0) {
     return new Response(
@@ -774,18 +818,26 @@ function handleChatCompletion(
     );
   }
 
-  // bridgeKey: model-specific, for active tool-call bridges
+  // bridgeKey: session/agent-scoped, for active tool-call bridges
   // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages, context.sessionId);
-  const convKey = deriveConversationKey(body.messages, context.sessionId);
+  const bridgeKey = deriveBridgeKey(modelId, body.messages, context.sessionId, context.agentKey);
+  const convKey = deriveConversationKey(body.messages, context.sessionId, context.agentKey);
   const activeBridge = activeBridges.get(bridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
     activeBridges.delete(bridgeKey);
 
     if (activeBridge.bridge.alive) {
+      if (activeBridge.modelId !== modelId) {
+        logPluginWarn("Resuming pending Cursor tool call on original model after model switch", {
+          requestedModelId: modelId,
+          resumedModelId: activeBridge.modelId,
+          convKey,
+          bridgeKey,
+        });
+      }
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, modelId, bridgeKey, convKey);
+      return handleToolResultResume(activeBridge, toolResults, bridgeKey, convKey);
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -803,23 +855,32 @@ function handleChatCompletion(
 
   let stored = conversationStates.get(convKey);
   if (!stored) {
-    stored = {
-      conversationId: crypto.randomUUID(),
-      checkpoint: null,
-      blobStore: new Map(),
-      lastAccessMs: Date.now(),
-    };
+    stored = createStoredConversation();
     conversationStates.set(convKey, stored);
   }
+
+  const systemPromptHash = hashString(systemPrompt);
+  if (
+    stored.checkpoint
+    && (
+      stored.systemPromptHash !== systemPromptHash
+      || (turns.length > 0 && stored.completedTurnsFingerprint !== completedTurnsFingerprint)
+    )
+  ) {
+    resetStoredConversation(stored);
+  }
+
+  stored.systemPromptHash = systemPromptHash;
+  stored.completedTurnsFingerprint = completedTurnsFingerprint;
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 
   // Build the request. When tool results are present but the bridge died,
   // we must still include the last user text so Cursor has context.
   const mcpTools = buildMcpToolDefinitions(tools);
-  const effectiveUserText = userText || (toolResults.length > 0
-    ? toolResults.map((r) => r.content).join("\n")
-    : "");
+  const effectiveUserText = toolResults.length > 0
+    ? buildToolResumePrompt(userText, pendingAssistantSummary, toolResults)
+    : userText;
   const payload = buildCursorRequest(
     modelId, systemPrompt, effectiveUserText, turns,
     stored.conversationId, stored.checkpoint, stored.blobStore,
@@ -827,9 +888,21 @@ function handleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
+    return handleNonStreamingResponse(payload, accessToken, modelId, convKey, {
+      systemPrompt,
+      systemPromptHash,
+      completedTurnsFingerprint,
+      turns,
+      userText,
+    });
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
+  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey, {
+    systemPrompt,
+    systemPromptHash,
+    completedTurnsFingerprint,
+    turns,
+    userText,
+  });
 }
 
 interface ToolResultInfo {
@@ -842,6 +915,8 @@ interface ParsedMessages {
   userText: string;
   turns: Array<{ userText: string; assistantText: string }>;
   toolResults: ToolResultInfo[];
+  pendingAssistantSummary: string;
+  completedTurnsFingerprint: string;
 }
 
 /** Normalize OpenAI message content to a plain string. */
@@ -854,10 +929,30 @@ function textContent(content: OpenAIMessage["content"]): string {
     .join("\n");
 }
 
+interface TurnSegmentText {
+  kind: "assistantText";
+  text: string;
+}
+
+interface TurnSegmentToolCalls {
+  kind: "assistantToolCalls";
+  toolCalls: OpenAIToolCall[];
+}
+
+interface TurnSegmentToolResult {
+  kind: "toolResult";
+  result: ToolResultInfo;
+}
+
+type TurnSegment = TurnSegmentText | TurnSegmentToolCalls | TurnSegmentToolResult;
+
+interface ParsedTurnState {
+  userText: string;
+  segments: TurnSegment[];
+}
+
 function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
   let systemPrompt = "You are a helpful assistant.";
-  const pairs: Array<{ userText: string; assistantText: string }> = [];
-  const toolResults: ToolResultInfo[] = [];
 
   // Collect system messages
   const systemParts = messages
@@ -867,40 +962,187 @@ function parseMessages(messages: OpenAIMessage[]): ParsedMessages {
     systemPrompt = systemParts.join("\n");
   }
 
-  // Separate tool results from conversation turns
   const nonSystem = messages.filter((m) => m.role !== "system");
-  let pendingUser = "";
+  const parsedTurns: ParsedTurnState[] = [];
+  let currentTurn: ParsedTurnState | undefined;
 
   for (const msg of nonSystem) {
-    if (msg.role === "tool") {
-      toolResults.push({
-        toolCallId: msg.tool_call_id ?? "",
-        content: textContent(msg.content),
-      });
-    } else if (msg.role === "user") {
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: "" });
-      }
-      pendingUser = textContent(msg.content);
-    } else if (msg.role === "assistant") {
-      // Skip assistant messages that are just tool_calls with no text
+    if (msg.role === "user") {
+      if (currentTurn) parsedTurns.push(currentTurn);
+      currentTurn = {
+        userText: textContent(msg.content),
+        segments: [],
+      };
+      continue;
+    }
+
+    if (!currentTurn) {
+      currentTurn = { userText: "", segments: [] };
+    }
+
+    if (msg.role === "assistant") {
       const text = textContent(msg.content);
-      if (pendingUser) {
-        pairs.push({ userText: pendingUser, assistantText: text });
-        pendingUser = "";
+      if (text) {
+        currentTurn.segments.push({ kind: "assistantText", text });
       }
+      if (msg.tool_calls?.length) {
+        currentTurn.segments.push({
+          kind: "assistantToolCalls",
+          toolCalls: msg.tool_calls,
+        });
+      }
+      continue;
+    }
+
+    if (msg.role === "tool") {
+      currentTurn.segments.push({
+        kind: "toolResult",
+        result: {
+          toolCallId: msg.tool_call_id ?? "",
+          content: textContent(msg.content),
+        },
+      });
     }
   }
 
-  let lastUserText = "";
-  if (pendingUser) {
-    lastUserText = pendingUser;
-  } else if (pairs.length > 0 && toolResults.length === 0) {
-    const last = pairs.pop()!;
-    lastUserText = last.userText;
+  if (currentTurn) parsedTurns.push(currentTurn);
+
+  let userText = "";
+  let toolResults: ToolResultInfo[] = [];
+  let pendingAssistantSummary = "";
+  let completedTurnStates = parsedTurns;
+
+  const lastTurn = parsedTurns.at(-1);
+  if (lastTurn) {
+    const trailingSegments = splitTrailingToolResults(lastTurn.segments);
+    const hasAssistantSummary = trailingSegments.base.length > 0;
+
+    if (trailingSegments.trailing.length > 0 && hasAssistantSummary) {
+      completedTurnStates = parsedTurns.slice(0, -1);
+      userText = lastTurn.userText;
+      toolResults = trailingSegments.trailing.map((segment) => segment.result);
+      pendingAssistantSummary = summarizeTurnSegments(trailingSegments.base);
+    } else if (lastTurn.userText && lastTurn.segments.length === 0) {
+      completedTurnStates = parsedTurns.slice(0, -1);
+      userText = lastTurn.userText;
+    }
   }
 
-  return { systemPrompt, userText: lastUserText, turns: pairs, toolResults };
+  const turns = completedTurnStates
+    .map((turn) => ({
+      userText: turn.userText,
+      assistantText: summarizeTurnSegments(turn.segments),
+    }))
+    .filter((turn) => turn.userText || turn.assistantText);
+
+  return {
+    systemPrompt,
+    userText,
+    turns,
+    toolResults,
+    pendingAssistantSummary,
+    completedTurnsFingerprint: buildCompletedTurnsFingerprint(systemPrompt, turns),
+  };
+}
+
+function splitTrailingToolResults(segments: TurnSegment[]): {
+  base: TurnSegment[];
+  trailing: TurnSegmentToolResult[];
+} {
+  let index = segments.length;
+  while (index > 0 && segments[index - 1]?.kind === "toolResult") {
+    index -= 1;
+  }
+
+  return {
+    base: segments.slice(0, index),
+    trailing: segments.slice(index).filter(
+      (segment): segment is TurnSegmentToolResult => segment.kind === "toolResult",
+    ),
+  };
+}
+
+function summarizeTurnSegments(segments: TurnSegment[]): string {
+  const parts: string[] = [];
+  for (const segment of segments) {
+    if (segment.kind === "assistantText") {
+      const trimmed = segment.text.trim();
+      if (trimmed) parts.push(trimmed);
+      continue;
+    }
+
+    if (segment.kind === "assistantToolCalls") {
+      const summary = segment.toolCalls.map(formatToolCallSummary).join("\n\n");
+      if (summary) parts.push(summary);
+      continue;
+    }
+
+    parts.push(formatToolResultSummary(segment.result));
+  }
+
+  return parts.join("\n\n").trim();
+}
+
+function formatToolCallSummary(call: OpenAIToolCall): string {
+  const args = call.function.arguments?.trim();
+  return args
+    ? `[assistant requested tool ${call.function.name} id=${call.id}]\n${args}`
+    : `[assistant requested tool ${call.function.name} id=${call.id}]`;
+}
+
+function formatToolResultSummary(result: ToolResultInfo): string {
+  const label = result.toolCallId
+    ? `[tool result id=${result.toolCallId}]`
+    : "[tool result]";
+  const content = result.content.trim();
+  return content ? `${label}\n${content}` : label;
+}
+
+function buildCompletedTurnsFingerprint(
+  systemPrompt: string,
+  turns: Array<{ userText: string; assistantText: string }>,
+): string {
+  return hashString(JSON.stringify({ systemPrompt, turns }));
+}
+
+function buildToolResumePrompt(
+  userText: string,
+  pendingAssistantSummary: string,
+  toolResults: ToolResultInfo[],
+): string {
+  const parts = [userText.trim()];
+  if (pendingAssistantSummary.trim()) {
+    parts.push(`[previous assistant tool activity]\n${pendingAssistantSummary.trim()}`);
+  }
+  if (toolResults.length > 0) {
+    parts.push(toolResults.map(formatToolResultSummary).join("\n\n"));
+  }
+  return parts.filter(Boolean).join("\n\n");
+}
+
+function selectToolsForChoice(
+  tools: OpenAIToolDef[],
+  toolChoice: unknown,
+): OpenAIToolDef[] {
+  if (!tools.length) return [];
+  if (toolChoice === undefined || toolChoice === null || toolChoice === "auto" || toolChoice === "required") {
+    return tools;
+  }
+  if (toolChoice === "none") {
+    return [];
+  }
+
+  if (typeof toolChoice === "object") {
+    const choice = toolChoice as {
+      type?: unknown;
+      function?: { name?: unknown };
+    };
+    if (choice.type === "function" && typeof choice.function?.name === "string") {
+      return tools.filter((tool) => tool.function.name === choice.function!.name);
+    }
+  }
+
+  return tools;
 }
 
 /** Convert OpenAI tool definitions to Cursor's MCP tool protobuf format. */
@@ -1449,38 +1691,46 @@ function sendExecResult(
   sendFrame(toBinary(AgentClientMessageSchema, clientMessage));
 }
 
-/** Derive a key for active bridge lookup (tool-call continuations). Model-specific. */
+/** Derive a key for active bridge lookup (tool-call continuations). */
 function deriveBridgeKey(
   modelId: string,
   messages: OpenAIMessage[],
   sessionId?: string,
+  agentKey?: string,
 ): string {
   if (sessionId) {
+    const normalizedAgent = normalizeAgentKey(agentKey);
     return createHash("sha256")
-      .update(`bridge:${sessionId}:${modelId}`)
+      .update(`bridge:${sessionId}:${normalizedAgent}`)
       .digest("hex")
       .slice(0, 16);
   }
 
   const firstUserMsg = messages.find((m) => m.role === "user");
   const firstUserText = firstUserMsg ? textContent(firstUserMsg.content) : "";
+  const normalizedAgent = normalizeAgentKey(agentKey);
   return createHash("sha256")
-    .update(`bridge:${modelId}:${firstUserText.slice(0, 200)}`)
+    .update(`bridge:${normalizedAgent}:${modelId}:${firstUserText.slice(0, 200)}`)
     .digest("hex")
     .slice(0, 16);
 }
 
 /** Derive a key for conversation state. Model-independent so context survives model switches. */
-function deriveConversationKey(messages: OpenAIMessage[], sessionId?: string): string {
+function deriveConversationKey(
+  messages: OpenAIMessage[],
+  sessionId?: string,
+  agentKey?: string,
+): string {
   if (sessionId) {
+    const normalizedAgent = normalizeAgentKey(agentKey);
     return createHash("sha256")
-      .update(`session:${sessionId}`)
+      .update(`session:${sessionId}:${normalizedAgent}`)
       .digest("hex")
       .slice(0, 16);
   }
 
   return createHash("sha256")
-    .update(buildConversationFingerprint(messages))
+    .update(`${normalizeAgentKey(agentKey)}:${buildConversationFingerprint(messages)}`)
     .digest("hex")
     .slice(0, 16);
 }
@@ -1492,6 +1742,35 @@ function buildConversationFingerprint(messages: OpenAIMessage[]): string {
   }).join("\n---\n");
 }
 
+interface ConversationRequestMetadata {
+  systemPrompt: string;
+  systemPromptHash: string;
+  completedTurnsFingerprint: string;
+  turns: Array<{ userText: string; assistantText: string }>;
+  userText: string;
+  assistantSeedText?: string;
+}
+
+function updateStoredConversationAfterCompletion(
+  convKey: string,
+  metadata: ConversationRequestMetadata,
+  assistantText: string,
+): void {
+  const stored = conversationStates.get(convKey);
+  if (!stored) return;
+
+  const nextTurns = metadata.userText
+    ? [...metadata.turns, { userText: metadata.userText, assistantText: assistantText.trim() }]
+    : metadata.turns;
+
+  stored.systemPromptHash = metadata.systemPromptHash;
+  stored.completedTurnsFingerprint = buildCompletedTurnsFingerprint(
+    metadata.systemPrompt,
+    nextTurns,
+  );
+  stored.lastAccessMs = Date.now();
+}
+
 /** Create an SSE streaming Response that reads from a live bridge. */
 function createBridgeStreamResponse(
   bridge: CursorSession,
@@ -1501,6 +1780,7 @@ function createBridgeStreamResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  metadata: ConversationRequestMetadata,
 ): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -1553,6 +1833,7 @@ function createBridgeStreamResponse(
         totalTokens: 0,
       };
       const tagFilter = createThinkingTagFilter();
+      let assistantText = metadata.assistantSeedText ?? "";
 
       let mcpExecReceived = false;
       let endStreamError: Error | null = null;
@@ -1576,7 +1857,10 @@ function createBridgeStreamResponse(
                 } else {
                   const { content, reasoning } = tagFilter.process(text);
                   if (reasoning) sendSSE(makeChunk({ reasoning_content: reasoning }));
-                  if (content) sendSSE(makeChunk({ content }));
+                  if (content) {
+                    assistantText += content;
+                    sendSSE(makeChunk({ content }));
+                  }
                 }
               },
               // onMcpExec — the model wants to execute a tool.
@@ -1586,7 +1870,22 @@ function createBridgeStreamResponse(
 
                 const flushed = tagFilter.flush();
                 if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-                if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+                if (flushed.content) {
+                  assistantText += flushed.content;
+                  sendSSE(makeChunk({ content: flushed.content }));
+                }
+
+                const assistantSeedText = [
+                  assistantText.trim(),
+                  formatToolCallSummary({
+                    id: exec.toolCallId,
+                    type: "function",
+                    function: {
+                      name: exec.toolName,
+                      arguments: exec.decodedArgs,
+                    },
+                  }),
+                ].filter(Boolean).join("\n\n");
 
                 const toolCallIndex = state.toolCallIndex++;
                 sendSSE(makeChunk({
@@ -1608,6 +1907,11 @@ function createBridgeStreamResponse(
                   blobStore,
                   mcpTools,
                   pendingExecs: state.pendingExecs,
+                  modelId,
+                  metadata: {
+                    ...metadata,
+                    assistantSeedText,
+                  },
                 });
 
                 sendSSE(makeChunk({}, "tool_calls"));
@@ -1660,7 +1964,11 @@ function createBridgeStreamResponse(
         if (!mcpExecReceived) {
           const flushed = tagFilter.flush();
           if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-          if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+          if (flushed.content) {
+            assistantText += flushed.content;
+            sendSSE(makeChunk({ content: flushed.content }));
+          }
+          updateStoredConversationAfterCompletion(convKey, metadata, assistantText);
           sendSSE(makeChunk({}, "stop"));
           sendSSE(makeUsageChunk());
           sendDone();
@@ -1705,12 +2013,13 @@ async function handleStreamingResponse(
   modelId: string,
   bridgeKey: string,
   convKey: string,
+  metadata: ConversationRequestMetadata,
 ): Promise<Response> {
   const { bridge, heartbeatTimer } = await startBridge(accessToken, payload.requestBytes);
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools,
-    modelId, bridgeKey, convKey,
+    modelId, bridgeKey, convKey, metadata,
   );
 }
 
@@ -1718,11 +2027,17 @@ async function handleStreamingResponse(
 function handleToolResultResume(
   active: ActiveBridge,
   toolResults: ToolResultInfo[],
-  modelId: string,
   bridgeKey: string,
   convKey: string,
 ): Response {
-  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs } = active;
+  const { bridge, heartbeatTimer, blobStore, mcpTools, pendingExecs, modelId, metadata } = active;
+  const resumeMetadata: ConversationRequestMetadata = {
+    ...metadata,
+    assistantSeedText: [
+      metadata.assistantSeedText?.trim() ?? "",
+      toolResults.map(formatToolResultSummary).join("\n\n"),
+    ].filter(Boolean).join("\n\n"),
+  };
 
   // Send mcpResult for each pending exec that has a matching tool result
   for (const exec of pendingExecs) {
@@ -1772,7 +2087,7 @@ function handleToolResultResume(
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools,
-    modelId, bridgeKey, convKey,
+    modelId, bridgeKey, convKey, resumeMetadata,
   );
 }
 
@@ -1781,10 +2096,21 @@ async function handleNonStreamingResponse(
   accessToken: string,
   modelId: string,
   convKey: string,
+  metadata: ConversationRequestMetadata,
 ): Promise<Response> {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const { text, usage } = await collectFullResponse(payload, accessToken, modelId, convKey);
+  const { text, usage, finishReason, toolCalls } = await collectFullResponse(
+    payload,
+    accessToken,
+    modelId,
+    convKey,
+    metadata,
+  );
+
+  const message = finishReason === "tool_calls"
+    ? { role: "assistant", content: null, tool_calls: toolCalls }
+    : { role: "assistant", content: text };
 
   return new Response(
     JSON.stringify({
@@ -1795,8 +2121,8 @@ async function handleNonStreamingResponse(
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content: text },
-          finish_reason: "stop",
+          message,
+          finish_reason: finishReason,
         },
       ],
       usage,
@@ -1808,6 +2134,8 @@ async function handleNonStreamingResponse(
 interface CollectedResponse {
   text: string;
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  finishReason: "stop" | "tool_calls";
+  toolCalls: OpenAIToolCall[];
 }
 
 async function collectFullResponse(
@@ -1815,10 +2143,12 @@ async function collectFullResponse(
   accessToken: string,
   modelId: string,
   convKey: string,
+  metadata: ConversationRequestMetadata,
 ): Promise<CollectedResponse> {
   const { promise, resolve, reject } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
   let endStreamError: Error | null = null;
+  const pendingToolCalls: OpenAIToolCall[] = [];
 
   const { bridge, heartbeatTimer } = await startBridge(accessToken, payload.requestBytes);
 
@@ -1848,7 +2178,17 @@ async function collectFullResponse(
             const { content } = tagFilter.process(text);
             fullText += content;
           },
-          () => { },
+          (exec) => {
+            pendingToolCalls.push({
+              id: exec.toolCallId,
+              type: "function",
+              function: {
+                name: exec.toolName,
+                arguments: exec.decodedArgs,
+              },
+            });
+            scheduleBridgeEnd(bridge);
+          },
           (checkpointBytes) => {
             const stored = conversationStates.get(convKey);
             if (stored) {
@@ -1889,10 +2229,16 @@ async function collectFullResponse(
       return;
     }
 
+    if (pendingToolCalls.length === 0) {
+      updateStoredConversationAfterCompletion(convKey, metadata, fullText);
+    }
+
     const usage = computeUsage(state);
     resolve({
       text: fullText,
       usage,
+      finishReason: pendingToolCalls.length > 0 ? "tool_calls" : "stop",
+      toolCalls: pendingToolCalls,
     });
   });
 
