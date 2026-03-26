@@ -2387,6 +2387,8 @@ async function testHandledInteractionQueriesProduceClientResponses(
     totalTokens: 0,
     interactionToolArgsText: new Map(),
     emittedToolCallIds: new Set(),
+    deferredInteractionExecs: new Map(),
+    deferredInteractionExecTimers: new Map(),
   });
 
   const sentFrames: Uint8Array[] = [];
@@ -2588,6 +2590,123 @@ async function testHandledInteractionQueriesProduceClientResponses(
   console.log("[test] Handled interaction query responses OK");
 }
 
+async function testExecMcpArgsPreferredOverInteractionToolCompletion(
+  modules: TestModules,
+) {
+  console.log("[test] Testing exec MCP args win over duplicate interaction tool completions...");
+
+  const state = {
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+    interactionToolArgsText: new Map(),
+    emittedToolCallIds: new Set(),
+    deferredInteractionExecs: new Map(),
+    deferredInteractionExecTimers: new Map(),
+  };
+
+  const processServerMessage = (message: any) => {
+    modules.processServerMessage(
+      message,
+      new Map(),
+      [],
+      () => {},
+      state as any,
+      () => {},
+      () => {},
+    );
+  };
+
+  processServerMessage(
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionUpdate",
+        value: {
+          message: {
+            case: "toolCallCompleted",
+            value: {
+              callId: "call-dup",
+              modelCallId: "model-call-dup",
+              toolCall: {
+                tool: {
+                  case: "mcpToolCall",
+                  value: {
+                    args: {
+                      name: "bash",
+                      toolName: "bash",
+                      toolCallId: "call-dup",
+                      providerIdentifier: "opencode",
+                      args: {
+                        command: toBinary(
+                          ValueSchema,
+                          fromJson(ValueSchema, 'echo "opencode_bash_ok"'),
+                        ),
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        } as any,
+      },
+    }),
+  );
+
+  processServerMessage(
+    create(AgentServerMessageSchema, {
+      message: {
+        case: "execServerMessage",
+        value: create(ExecServerMessageSchema, {
+          id: 42,
+          execId: "exec-dup",
+          message: {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, {
+              name: "bash",
+              toolName: "bash",
+              toolCallId: "call-dup",
+              providerIdentifier: "opencode",
+              args: {
+                command: toBinary(
+                  ValueSchema,
+                  fromJson(ValueSchema, 'echo "opencode_bash_ok"'),
+                ),
+              },
+            }),
+          },
+        }),
+      },
+    }),
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 125));
+
+  assertEqual(
+    state.emittedToolCallIds.size,
+    1,
+    "Expected duplicate interaction and exec MCP tool events to surface only one tool call",
+  );
+  assertEqual(
+    (state.pendingExecs as Array<{ execId: string }>)[0]?.execId,
+    "exec-dup",
+    "Expected the actionable execServerMessage metadata to win when both Cursor channels report the same tool call",
+  );
+  assertEqual(
+    (state.pendingExecs as Array<{ execMsgId: number }>)[0]?.execMsgId,
+    42,
+    "Expected the actionable execServerMessage id to be preserved for tool result resume",
+  );
+  assertEqual(
+    state.pendingExecs.length,
+    1,
+    "Expected pending exec state to retain only one actionable MCP exec",
+  );
+
+  console.log("[test] Exec MCP args preference over duplicate interaction completions OK");
+}
+
 async function testUnsupportedSetupVmInteractionQueryFailsFast(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -2677,6 +2796,7 @@ async function main() {
     await testPendingToolResultResumeAcrossModelSwitch(modules, backend);
     await testUnsupportedExecFailsFast(modules, backend);
     await testHandledInteractionQueriesProduceClientResponses(modules);
+    await testExecMcpArgsPreferredOverInteractionToolCompletion(modules);
     await testUnsupportedSetupVmInteractionQueryFailsFast(modules, backend);
     await testEndStreamStopsHeartbeats(modules, backend);
     await testTurnEndedStopsStreamingResponse(modules, backend);

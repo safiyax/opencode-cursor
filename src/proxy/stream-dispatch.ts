@@ -75,6 +75,8 @@ export interface UnsupportedServerMessageInfo {
   detail?: string;
 }
 
+const INTERACTION_TOOL_CALL_DEFER_MS = 75;
+
 export function parseConnectEndStream(data: Uint8Array): Error | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
@@ -210,6 +212,81 @@ export function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
+function getPendingExecKey(exec: PendingExec): string {
+  return exec.toolCallId || `${exec.toolName}:${exec.decodedArgs}`;
+}
+
+function replacePendingExec(state: StreamState, exec: PendingExec): void {
+  const execKey = getPendingExecKey(exec);
+  const existingIndex = state.pendingExecs.findIndex(
+    (candidate) => getPendingExecKey(candidate) === execKey,
+  );
+  if (existingIndex >= 0) {
+    state.pendingExecs[existingIndex] = exec;
+    return;
+  }
+
+  state.pendingExecs.push(exec);
+}
+
+function emitPendingExec(
+  exec: PendingExec,
+  state: StreamState,
+  onMcpExec: (exec: PendingExec) => void,
+): void {
+  const execKey = getPendingExecKey(exec);
+  if (state.emittedToolCallIds.has(execKey)) {
+    replacePendingExec(state, exec);
+    return;
+  }
+
+  state.emittedToolCallIds.add(execKey);
+  replacePendingExec(state, exec);
+  onMcpExec(exec);
+}
+
+function clearDeferredInteractionExec(
+  state: StreamState,
+  execKey: string,
+): void {
+  const timer = state.deferredInteractionExecTimers.get(execKey);
+  if (timer) clearTimeout(timer);
+  state.deferredInteractionExecTimers.delete(execKey);
+  state.deferredInteractionExecs.delete(execKey);
+}
+
+function queueInteractionPendingExec(
+  exec: PendingExec,
+  state: StreamState,
+  onMcpExec: (exec: PendingExec) => void,
+): void {
+  const execKey = getPendingExecKey(exec);
+  if (
+    state.emittedToolCallIds.has(execKey) ||
+    state.deferredInteractionExecs.has(execKey)
+  ) {
+    return;
+  }
+
+  state.deferredInteractionExecs.set(execKey, exec);
+  const timer = setTimeout(() => {
+    state.deferredInteractionExecTimers.delete(execKey);
+    const pendingExec = state.deferredInteractionExecs.get(execKey);
+    if (!pendingExec) return;
+    state.deferredInteractionExecs.delete(execKey);
+    emitPendingExec(pendingExec, state, onMcpExec);
+  }, INTERACTION_TOOL_CALL_DEFER_MS);
+  state.deferredInteractionExecTimers.set(execKey, timer);
+}
+
+export function clearDeferredInteractionExecs(state: StreamState): void {
+  for (const timer of state.deferredInteractionExecTimers.values()) {
+    clearTimeout(timer);
+  }
+  state.deferredInteractionExecTimers.clear();
+  state.deferredInteractionExecs.clear();
+}
+
 export function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
@@ -241,6 +318,7 @@ export function processServerMessage(
       msg.message.value as ExecServerMessage,
       mcpTools,
       sendFrame,
+      state,
       onMcpExec,
       onUnhandledExec,
     );
@@ -292,11 +370,15 @@ function handleInteractionUpdate(
   } else if (updateCase === "partialToolCall") {
     const partial = update.message.value;
     if (partial.callId && partial.argsTextDelta) {
-      state.interactionToolArgsText.set(partial.callId, partial.argsTextDelta);
+      const existing = state.interactionToolArgsText.get(partial.callId) ?? "";
+      state.interactionToolArgsText.set(
+        partial.callId,
+        `${existing}${partial.argsTextDelta}`,
+      );
     }
   } else if (updateCase === "toolCallCompleted") {
     const exec = decodeInteractionToolCall(update.message.value, state);
-    if (exec) onMcpExec(exec);
+    if (exec) queueInteractionPendingExec(exec, state, onMcpExec);
   } else if (updateCase === "turnEnded") {
     onTurnEnded?.();
   } else if (
@@ -365,7 +447,6 @@ function decodeInteractionToolCall(
     decodedArgs = partialArgsText;
   }
 
-  state.emittedToolCallIds.add(toolCallId);
   if (callId) state.interactionToolArgsText.delete(callId);
 
   return {
@@ -581,6 +662,7 @@ function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
   sendFrame: (data: Uint8Array) => void,
+  state: StreamState,
   onMcpExec: (exec: PendingExec) => void,
   onUnhandledExec?: (info: UnhandledExecInfo) => void,
 ): void {
@@ -610,13 +692,15 @@ function handleExecMessage(
   if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
     const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
-    onMcpExec({
+    const exec = {
       execId: execMsg.execId,
       execMsgId: execMsg.id,
       toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
       toolName: mcpArgs.toolName || mcpArgs.name,
       decodedArgs: JSON.stringify(decoded),
-    });
+    };
+    clearDeferredInteractionExec(state, getPendingExecKey(exec));
+    emitPendingExec(exec, state, onMcpExec);
     return;
   }
 

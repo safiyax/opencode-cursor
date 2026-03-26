@@ -31,6 +31,7 @@ import { SSE_HEADERS } from "./sse";
 import type { StreamState } from "./stream-state";
 import type { ActiveBridge, CursorRequestPayload } from "./types";
 import {
+  clearDeferredInteractionExecs,
   computeUsage,
   createConnectFrameParser,
   createThinkingTagFilter,
@@ -54,6 +55,7 @@ function createBridgeStreamResponse(
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
   let keepaliveTimer: NodeJS.Timeout | undefined;
+  let activeState: StreamState | undefined;
 
   const stopKeepalive = () => {
     if (!keepaliveTimer) return;
@@ -72,7 +74,10 @@ function createBridgeStreamResponse(
         totalTokens: 0,
         interactionToolArgsText: new Map(),
         emittedToolCallIds: new Set(),
+        deferredInteractionExecs: new Map(),
+        deferredInteractionExecTimers: new Map(),
       };
+      activeState = state;
       const tagFilter = createThinkingTagFilter();
       let assistantText = metadata.assistantSeedText ?? "";
       let mcpExecReceived = false;
@@ -285,6 +290,7 @@ function createBridgeStreamResponse(
       bridge.onClose((code) => {
         clearInterval(heartbeatTimer);
         stopKeepalive();
+        clearDeferredInteractionExecs(state);
         syncStoredBlobStore(convKey, blobStore);
 
         if (endStreamError) {
@@ -323,6 +329,7 @@ function createBridgeStreamResponse(
     cancel(reason) {
       stopKeepalive();
       clearInterval(heartbeatTimer);
+      if (activeState) clearDeferredInteractionExecs(activeState);
       syncStoredBlobStore(convKey, blobStore);
       const active = activeBridges.get(bridgeKey);
       if (active?.bridge === bridge) {

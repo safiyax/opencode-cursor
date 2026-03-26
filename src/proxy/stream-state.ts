@@ -7,4 +7,6 @@ export interface StreamState {
   totalTokens: number;
   interactionToolArgsText: Map<string, string>;
   emittedToolCallIds: Set<string>;
+  deferredInteractionExecs: Map<string, PendingExec>;
+  deferredInteractionExecTimers: Map<string, NodeJS.Timeout>;
 }
