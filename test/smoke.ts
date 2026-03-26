@@ -29,7 +29,7 @@ type RunMode =
   | "turn-ended-hold"
   | "checkpoint-then-close"
   | "tool-call-pause"
-  | "unsupported-interaction-query-pause"
+  | "unsupported-setup-vm-query-pause"
   | "unsupported-exec-pause"
   | "verbose-title-close";
 
@@ -48,6 +48,7 @@ interface TestModules {
   getProxyPort: typeof import("../src/proxy").getProxyPort;
   callCursorUnaryRpc: typeof import("../src/proxy").callCursorUnaryRpc;
   createCursorSession: typeof import("../src/cursor").createCursorSession;
+  processServerMessage: typeof import("../src/proxy/stream-dispatch").processServerMessage;
   configurePluginLogger: typeof import("../src/logger").configurePluginLogger;
   logPluginError: typeof import("../src/logger").logPluginError;
   flushPluginLogs: typeof import("../src/logger").flushPluginLogs;
@@ -311,15 +312,10 @@ function makeUnsupportedInteractionQueryFrame(): Buffer {
       value: {
         id: 9,
         query: {
-          case: "askQuestionInteractionQuery",
+          case: "setupVmEnvironmentArgs",
           value: {
-            toolCallId: "call-question-1",
-            args: {
-              title: "Question",
-              questions: [],
-              runAsync: false,
-              asyncOriginalToolCallId: "",
-            },
+            installCommand: "npm install",
+            startCommand: "npm run dev",
           },
         },
       } as any,
@@ -498,7 +494,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       writeRunFrame(makeTextDeltaFrame("native tool update ignored"));
       writeRunFrame(makeInteractionNativeToolCallCompletedFrame());
       writeRunFrame(makeTurnEndedFrame());
-    } else if (runMode === "unsupported-interaction-query-pause") {
+    } else if (runMode === "unsupported-setup-vm-query-pause") {
       writeRunFrame(makeUnsupportedInteractionQueryFrame());
     } else if (runMode === "turn-ended-hold") {
       writeRunFrame(makeTextDeltaFrame("completed response"));
@@ -715,6 +711,7 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
 async function loadModules(): Promise<TestModules> {
   const cursor = await import("../src/cursor");
   const proxy = await import("../src/proxy");
+  const streamDispatch = await import("../src/proxy/stream-dispatch");
   const auth = await import("../src/auth");
   const index = await import("../src/index");
   const logger = await import("../src/logger");
@@ -725,6 +722,7 @@ async function loadModules(): Promise<TestModules> {
     getProxyPort: proxy.getProxyPort,
     callCursorUnaryRpc: proxy.callCursorUnaryRpc,
     createCursorSession: cursor.createCursorSession,
+    processServerMessage: streamDispatch.processServerMessage,
     configurePluginLogger: logger.configurePluginLogger,
     logPluginError: logger.logPluginError,
     flushPluginLogs: logger.flushPluginLogs,
@@ -2377,15 +2375,228 @@ async function testUnsupportedExecFailsFast(
   console.log("[test] Unsupported exec fast failure OK");
 }
 
-async function testUnsupportedInteractionQueryFailsFast(
+async function testHandledInteractionQueriesProduceClientResponses(
+  modules: TestModules,
+) {
+  console.log("[test] Testing handled interaction query responses...");
+
+  const buildState = () => ({
+    toolCallIndex: 0,
+    pendingExecs: [],
+    outputTokens: 0,
+    totalTokens: 0,
+    interactionToolArgsText: new Map(),
+    emittedToolCallIds: new Set(),
+  });
+
+  const sentFrames: Uint8Array[] = [];
+  const unsupported: Array<{ category: string; caseName: string }> = [];
+
+  const assertInteractionResponse = (
+    expectedId: number,
+    expectedCase: string,
+  ): any => {
+    const payload = sentFrames[sentFrames.length - 1];
+    assert(payload, "Expected an interaction response frame to be sent");
+    const clientMessage = fromBinary(AgentClientMessageSchema, payload) as any;
+    assertEqual(
+      clientMessage.message.case,
+      "interactionResponse",
+      "Expected an interaction response client message",
+    );
+    assertEqual(
+      clientMessage.message.value.id,
+      expectedId,
+      "Expected interaction response ID to match the query ID",
+    );
+    assertEqual(
+      clientMessage.message.value.result.case,
+      expectedCase,
+      "Expected interaction response case to match the handled query",
+    );
+    return clientMessage.message.value.result.value;
+  };
+
+  const processInteractionQuery = (id: number, queryCase: string, value: any) => {
+    const serverMessage = create(AgentServerMessageSchema, {
+      message: {
+        case: "interactionQuery",
+        value: {
+          id,
+          query: {
+            case: queryCase,
+            value,
+          },
+        } as any,
+      },
+    });
+
+    modules.processServerMessage(
+      serverMessage,
+      new Map(),
+      [],
+      (data) => sentFrames.push(data),
+      buildState() as any,
+      () => {},
+      () => {},
+      undefined,
+      undefined,
+      (info) => unsupported.push(info as any),
+    );
+  };
+
+  processInteractionQuery(11, "webSearchRequestQuery", {
+    args: { searchTerm: "opencode", toolCallId: "web-1" },
+  });
+  const webSearchResponse = assertInteractionResponse(11, "webSearchRequestResponse");
+  assertEqual(
+    webSearchResponse.result.case,
+    "rejected",
+    "Expected web search request to be rejected back to MCP",
+  );
+  assert(
+    webSearchResponse.result.value.reason.includes("websearch"),
+    `Expected web search rejection reason to mention MCP websearch, got ${JSON.stringify(webSearchResponse)}`,
+  );
+
+  processInteractionQuery(12, "askQuestionInteractionQuery", {
+    toolCallId: "question-1",
+    args: {
+      title: "Pick an option",
+      questions: [
+        {
+          id: "q1",
+          prompt: "Proceed?",
+          options: [{ id: "yes", label: "Yes" }],
+          allowMultiple: false,
+        },
+      ],
+      runAsync: false,
+      asyncOriginalToolCallId: "",
+    },
+  });
+  const askQuestionResponse = assertInteractionResponse(
+    12,
+    "askQuestionInteractionResponse",
+  );
+  assertEqual(
+    askQuestionResponse.result.result.case,
+    "rejected",
+    "Expected ask-question interaction to be rejected back to MCP",
+  );
+  assert(
+    askQuestionResponse.result.result.value.reason.includes("question"),
+    `Expected ask-question rejection reason to mention MCP question, got ${JSON.stringify(askQuestionResponse)}`,
+  );
+
+  processInteractionQuery(13, "switchModeRequestQuery", {
+    args: {
+      targetModeId: "plan",
+      explanation: "Need planning",
+      toolCallId: "switch-1",
+    },
+  });
+  const switchModeResponse = assertInteractionResponse(
+    13,
+    "switchModeRequestResponse",
+  );
+  assertEqual(
+    switchModeResponse.result.case,
+    "rejected",
+    "Expected switch-mode interaction to be rejected",
+  );
+
+  processInteractionQuery(14, "exaSearchRequestQuery", {
+    args: { query: "opencode", type: "auto", numResults: 5, toolCallId: "exa-1" },
+  });
+  const exaSearchResponse = assertInteractionResponse(
+    14,
+    "exaSearchRequestResponse",
+  );
+  assertEqual(
+    exaSearchResponse.result.case,
+    "rejected",
+    "Expected Exa search interaction to be rejected back to MCP",
+  );
+  assert(
+    exaSearchResponse.result.value.reason.includes("websearch"),
+    `Expected Exa search rejection reason to mention MCP websearch, got ${JSON.stringify(exaSearchResponse)}`,
+  );
+
+  processInteractionQuery(15, "exaFetchRequestQuery", {
+    args: { ids: ["doc-1"], toolCallId: "exafetch-1" },
+  });
+  const exaFetchResponse = assertInteractionResponse(
+    15,
+    "exaFetchRequestResponse",
+  );
+  assertEqual(
+    exaFetchResponse.result.case,
+    "rejected",
+    "Expected Exa fetch interaction to be rejected back to MCP",
+  );
+  assert(
+    exaFetchResponse.result.value.reason.includes("webfetch"),
+    `Expected Exa fetch rejection reason to mention MCP tools, got ${JSON.stringify(exaFetchResponse)}`,
+  );
+
+  processInteractionQuery(16, "createPlanRequestQuery", {
+    toolCallId: "plan-1",
+    args: {
+      plan: "Outline the work",
+      todos: [],
+      overview: "overview",
+      name: "plan",
+      isProject: false,
+      phases: [],
+    },
+  });
+  const createPlanResponse = assertInteractionResponse(
+    16,
+    "createPlanRequestResponse",
+  );
+  assertEqual(
+    createPlanResponse.result.result.case,
+    "error",
+    "Expected create-plan interaction to return an error response",
+  );
+  assert(
+    createPlanResponse.result.result.value.error.includes("planning tools"),
+    `Expected create-plan error to explain the MCP fallback, got ${JSON.stringify(createPlanResponse)}`,
+  );
+
+  processInteractionQuery(17, "setupVmEnvironmentArgs", {
+    installCommand: "npm install",
+    startCommand: "npm run dev",
+  });
+  assertEqual(
+    sentFrames.length,
+    6,
+    "Expected setup VM query to remain unsupported and not send a response",
+  );
+  assertEqual(
+    unsupported.length,
+    1,
+    "Expected exactly one unsupported interaction query callback",
+  );
+  assertEqual(
+    unsupported[0]?.caseName,
+    "setupVmEnvironmentArgs",
+    "Expected setup VM interaction query to remain unsupported",
+  );
+
+  console.log("[test] Handled interaction query responses OK");
+}
+
+async function testUnsupportedSetupVmInteractionQueryFailsFast(
   modules: TestModules,
   backend: TestCursorBackend,
 ) {
-  console.log("[test] Testing unsupported interaction query fast failure...");
+  console.log("[test] Testing unsupported setup VM interaction query fast failure...");
 
   try {
     backend.resetObservations();
-    backend.setRunMode("unsupported-interaction-query-pause");
+    backend.setRunMode("unsupported-setup-vm-query-pause");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
     const response = await fetch(
@@ -2415,21 +2626,21 @@ async function testUnsupportedInteractionQueryFailsFast(
 
     assert(
       settled.kind !== "timeout",
-      "Expected unsupported interaction query stream to fail fast instead of hanging",
+      "Expected unsupported setup VM interaction query stream to fail fast instead of hanging",
     );
     assert(
       settled.kind === "resolved" &&
         settled.body.includes(
-          '"error":{"message":"Cursor returned unsupported interactionQuery: askQuestionInteractionQuery"',
+          '"error":{"message":"Cursor returned unsupported interactionQuery: setupVmEnvironmentArgs"',
         ),
-      `Expected unsupported interaction query stream to surface an explicit SSE error, got ${JSON.stringify(settled)}`,
+      `Expected unsupported setup VM interaction query stream to surface an explicit SSE error, got ${JSON.stringify(settled)}`,
     );
   } finally {
     modules.stopProxy();
     backend.setRunMode("close-on-append");
   }
 
-  console.log("[test] Unsupported interaction query fast failure OK");
+  console.log("[test] Unsupported setup VM interaction query fast failure OK");
 }
 
 async function main() {
@@ -2465,7 +2676,8 @@ async function main() {
     await testSystemPromptForwardedToCursorRunRequest(modules, backend);
     await testPendingToolResultResumeAcrossModelSwitch(modules, backend);
     await testUnsupportedExecFailsFast(modules, backend);
-    await testUnsupportedInteractionQueryFailsFast(modules, backend);
+    await testHandledInteractionQueriesProduceClientResponses(modules);
+    await testUnsupportedSetupVmInteractionQueryFailsFast(modules, backend);
     await testEndStreamStopsHeartbeats(modules, backend);
     await testTurnEndedStopsStreamingResponse(modules, backend);
     await testInteractionToolCallCompletesStreamingResponse(modules, backend);

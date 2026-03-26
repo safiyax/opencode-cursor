@@ -1,19 +1,30 @@
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
+  AskQuestionInteractionResponseSchema,
+  AskQuestionRejectedSchema,
+  AskQuestionResultSchema,
   ClientHeartbeatSchema,
   ConversationStateStructureSchema,
   BackgroundShellSpawnResultSchema,
+  CreatePlanErrorSchema,
+  CreatePlanRequestResponseSchema,
+  CreatePlanResultSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
   DiagnosticsResultSchema,
   ExecClientMessageSchema,
+  ExaFetchRequestResponseSchema,
+  ExaFetchRequestResponse_RejectedSchema,
+  ExaSearchRequestResponseSchema,
+  ExaSearchRequestResponse_RejectedSchema,
   FetchErrorSchema,
   FetchResultSchema,
   GetBlobResultSchema,
   GrepErrorSchema,
   GrepResultSchema,
   type InteractionQuery,
+  InteractionResponseSchema,
   KvClientMessageSchema,
   LsRejectedSchema,
   LsResultSchema,
@@ -26,6 +37,10 @@ import {
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  SwitchModeRequestResponseSchema,
+  SwitchModeRequestResponse_RejectedSchema,
+  WebSearchRequestResponseSchema,
+  WebSearchRequestResponse_RejectedSchema,
   WriteRejectedSchema,
   WriteResultSchema,
   WriteShellStdinErrorSchema,
@@ -235,10 +250,11 @@ export function processServerMessage(
       caseName: msg.message.value.message.case ?? "undefined",
     });
   } else if (msgCase === "interactionQuery") {
-    onUnsupportedMessage?.({
-      category: "interactionQuery",
-      caseName: (msg.message.value as InteractionQuery).query.case ?? "undefined",
-    });
+    handleInteractionQuery(
+      msg.message.value as InteractionQuery,
+      sendFrame,
+      onUnsupportedMessage,
+    );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
@@ -361,6 +377,138 @@ function decodeInteractionToolCall(
   };
 }
 
+function handleInteractionQuery(
+  query: InteractionQuery,
+  sendFrame: (data: Uint8Array) => void,
+  onUnsupportedMessage?: (info: UnsupportedServerMessageInfo) => void,
+): void {
+  const queryCase = query.query.case;
+
+  if (queryCase === "webSearchRequestQuery") {
+    const response = create(WebSearchRequestResponseSchema, {
+      result: {
+        case: "rejected",
+        value: create(WebSearchRequestResponse_RejectedSchema, {
+          reason:
+            "Native Cursor web search is not available in this environment. Use the provided MCP tool `websearch` instead.",
+        }),
+      },
+    });
+    sendInteractionResponse(
+      query.id,
+      "webSearchRequestResponse",
+      response,
+      sendFrame,
+    );
+    return;
+  }
+
+  if (queryCase === "askQuestionInteractionQuery") {
+    const response = create(AskQuestionInteractionResponseSchema, {
+      result: create(AskQuestionResultSchema, {
+        result: {
+          case: "rejected",
+          value: create(AskQuestionRejectedSchema, {
+            reason:
+              "Native Cursor question prompts are not available in this environment. Use the provided MCP tool `question` instead.",
+          }),
+        },
+      }),
+    });
+    sendInteractionResponse(
+      query.id,
+      "askQuestionInteractionResponse",
+      response,
+      sendFrame,
+    );
+    return;
+  }
+
+  if (queryCase === "switchModeRequestQuery") {
+    const response = create(SwitchModeRequestResponseSchema, {
+      result: {
+        case: "rejected",
+        value: create(SwitchModeRequestResponse_RejectedSchema, {
+          reason:
+            "Cursor mode switching is not available in this environment. Continue using the current agent and the provided MCP tools.",
+        }),
+      },
+    });
+    sendInteractionResponse(
+      query.id,
+      "switchModeRequestResponse",
+      response,
+      sendFrame,
+    );
+    return;
+  }
+
+  if (queryCase === "exaSearchRequestQuery") {
+    const response = create(ExaSearchRequestResponseSchema, {
+      result: {
+        case: "rejected",
+        value: create(ExaSearchRequestResponse_RejectedSchema, {
+          reason:
+            "Native Cursor Exa search is not available in this environment. Use the provided MCP tool `websearch` instead.",
+        }),
+      },
+    });
+    sendInteractionResponse(
+      query.id,
+      "exaSearchRequestResponse",
+      response,
+      sendFrame,
+    );
+    return;
+  }
+
+  if (queryCase === "exaFetchRequestQuery") {
+    const response = create(ExaFetchRequestResponseSchema, {
+      result: {
+        case: "rejected",
+        value: create(ExaFetchRequestResponse_RejectedSchema, {
+          reason:
+            "Native Cursor Exa fetch is not available in this environment. Use the provided MCP tools `websearch` and `webfetch` instead.",
+        }),
+      },
+    });
+    sendInteractionResponse(
+      query.id,
+      "exaFetchRequestResponse",
+      response,
+      sendFrame,
+    );
+    return;
+  }
+
+  if (queryCase === "createPlanRequestQuery") {
+    const response = create(CreatePlanRequestResponseSchema, {
+      result: create(CreatePlanResultSchema, {
+        planUri: "",
+        result: {
+          case: "error",
+          value: create(CreatePlanErrorSchema, {
+            error:
+              "Native Cursor plan creation is not available in this environment. Use the provided MCP planning tools instead.",
+          }),
+        },
+      }),
+    });
+    sendInteractionResponse(
+      query.id,
+      "createPlanRequestResponse",
+      response,
+      sendFrame,
+    );
+    return;
+  }
+
+  onUnsupportedMessage?.({
+    category: "interactionQuery",
+    caseName: queryCase ?? "undefined",
+  });
+}
+
 /** Send a KV client response back to Cursor. */
 function sendKvResponse(
   kvMsg: KvServerMessage,
@@ -376,6 +524,22 @@ function sendKvResponse(
     message: { case: "kvClientMessage", value: response },
   });
   sendFrame(toBinary(AgentClientMessageSchema, clientMsg));
+}
+
+function sendInteractionResponse(
+  queryId: number,
+  messageCase: string,
+  value: unknown,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const response = create(InteractionResponseSchema, {
+    id: queryId,
+    result: { case: messageCase as any, value: value as any },
+  });
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "interactionResponse", value: response },
+  });
+  sendFrame(toBinary(AgentClientMessageSchema, clientMessage));
 }
 
 function handleKvMessage(
