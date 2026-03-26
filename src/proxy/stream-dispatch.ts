@@ -210,101 +210,6 @@ export function computeUsage(state: StreamState) {
   return { prompt_tokens, completion_tokens, total_tokens };
 }
 
-function replacePendingExec(state: StreamState, exec: PendingExec): void {
-  const existingIndex = state.pendingExecs.findIndex(
-    (candidate) => candidate.toolCallId === exec.toolCallId,
-  );
-  if (existingIndex >= 0) {
-    state.pendingExecs[existingIndex] = exec;
-    return;
-  }
-
-  state.pendingExecs.push(exec);
-}
-
-function hasUsableDecodedArgs(decodedArgs: string): boolean {
-  const trimmed = decodedArgs.trim();
-  return trimmed !== "" && trimmed !== "{}";
-}
-
-function mergePendingExec(existing: PendingExec, incoming: PendingExec): PendingExec {
-  const incomingHasExecMetadata = incoming.execMsgId !== 0;
-  const existingHasExecMetadata = existing.execMsgId !== 0;
-
-  return {
-    execId:
-      incomingHasExecMetadata || !existing.execId ? incoming.execId : existing.execId,
-    execMsgId:
-      incomingHasExecMetadata || !existingHasExecMetadata
-        ? incoming.execMsgId
-        : existing.execMsgId,
-    toolCallId: existing.toolCallId || incoming.toolCallId,
-    toolName:
-      incoming.toolName && incoming.toolName !== "unknown_mcp_tool"
-        ? incoming.toolName
-        : existing.toolName,
-    decodedArgs: hasUsableDecodedArgs(incoming.decodedArgs)
-      ? incoming.decodedArgs
-      : existing.decodedArgs,
-    source: incomingHasExecMetadata ? incoming.source : existing.source ?? incoming.source,
-    cursorCallId: existing.cursorCallId || incoming.cursorCallId,
-    modelCallId: existing.modelCallId || incoming.modelCallId,
-  };
-}
-
-function emitPendingExec(
-  exec: PendingExec,
-  state: StreamState,
-  onMcpExec: (exec: PendingExec) => void,
-): void {
-  const existing = state.pendingExecs.find(
-    (candidate) => candidate.toolCallId === exec.toolCallId,
-  );
-  const nextExec = existing ? mergePendingExec(existing, exec) : exec;
-  const hadActionableMetadata = (existing?.execMsgId ?? 0) !== 0;
-  const hasActionableMetadata = nextExec.execMsgId !== 0;
-
-  if (state.emittedToolCallIds.has(nextExec.toolCallId)) {
-    replacePendingExec(state, nextExec);
-    if (!hadActionableMetadata && hasActionableMetadata) {
-      logPluginInfo("Cursor MCP tool call metadata upgraded", {
-        toolCallId: nextExec.toolCallId,
-        toolName: nextExec.toolName,
-        source: nextExec.source,
-        execId: nextExec.execId,
-        execMsgId: nextExec.execMsgId,
-        cursorCallId: nextExec.cursorCallId,
-        modelCallId: nextExec.modelCallId,
-      });
-    } else {
-      logPluginInfo("Ignored duplicate Cursor MCP tool call event", {
-        toolCallId: nextExec.toolCallId,
-        toolName: nextExec.toolName,
-        source: nextExec.source,
-        execId: nextExec.execId,
-        execMsgId: nextExec.execMsgId,
-        cursorCallId: nextExec.cursorCallId,
-        modelCallId: nextExec.modelCallId,
-      });
-    }
-    return;
-  }
-
-  state.emittedToolCallIds.add(nextExec.toolCallId);
-  replacePendingExec(state, nextExec);
-  logPluginInfo("Emitting Cursor MCP tool call", {
-    toolCallId: nextExec.toolCallId,
-    toolName: nextExec.toolName,
-    source: nextExec.source,
-    execId: nextExec.execId,
-    execMsgId: nextExec.execMsgId,
-    cursorCallId: nextExec.cursorCallId,
-    modelCallId: nextExec.modelCallId,
-    decodedArgs: nextExec.decodedArgs,
-  });
-  onMcpExec(nextExec);
-}
-
 export function processServerMessage(
   msg: AgentServerMessage,
   blobStore: Map<string, Uint8Array>,
@@ -325,7 +230,6 @@ export function processServerMessage(
       msg.message.value,
       state,
       onText,
-      onMcpExec,
       onTurnEnded,
       onUnsupportedMessage,
     );
@@ -371,7 +275,6 @@ function handleInteractionUpdate(
   update: any,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
-  onMcpExec: (exec: PendingExec) => void,
   onTurnEnded?: () => void,
   onUnsupportedMessage?: (info: UnsupportedServerMessageInfo) => void,
 ): void {
@@ -399,28 +302,19 @@ function handleInteractionUpdate(
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
   } else if (updateCase === "partialToolCall") {
-    const partial = update.message.value;
-    if (partial.callId && partial.argsTextDelta) {
-      const existing = state.interactionToolArgsText.get(partial.callId) ?? "";
-      state.interactionToolArgsText.set(
-        partial.callId,
-        `${existing}${partial.argsTextDelta}`,
-      );
-    }
+    return;
   } else if (updateCase === "toolCallCompleted") {
-    const exec = decodeInteractionToolCall(update.message.value, state);
-    if (exec) {
-      logPluginInfo("Received Cursor interaction MCP tool call", {
-        toolCallId: exec.toolCallId,
-        toolName: exec.toolName,
-        source: exec.source,
-        execId: exec.execId,
-        execMsgId: exec.execMsgId,
-        cursorCallId: exec.cursorCallId,
-        modelCallId: exec.modelCallId,
-        decodedArgs: exec.decodedArgs,
+    const toolValue = update.message.value;
+    if (toolValue?.toolCall?.tool?.case === "mcpToolCall") {
+      logPluginInfo("Ignoring Cursor interaction MCP tool completion", {
+        callId: toolValue.callId,
+        modelCallId: toolValue.modelCallId,
+        toolCallId:
+          toolValue.toolCall.tool.value?.args?.toolCallId || toolValue.callId,
+        toolName:
+          toolValue.toolCall.tool.value?.args?.toolName ||
+          toolValue.toolCall.tool.value?.args?.name,
       });
-      emitPendingExec(exec, state, onMcpExec);
     }
   } else if (updateCase === "turnEnded") {
     onTurnEnded?.();
@@ -443,64 +337,8 @@ function handleInteractionUpdate(
       caseName: updateCase ?? "undefined",
     });
   }
-  // toolCallStarted, partialToolCall, toolCallDelta, and non-MCP
-  // toolCallCompleted updates are informational only. Actionable MCP tool
-  // calls may still appear here on some models, so we surface those, but we
-  // do not abort the bridge for native Cursor tool-call progress events.
-}
-
-function decodeInteractionToolCall(
-  update: {
-    callId?: string;
-    modelCallId?: string;
-    toolCall?: {
-      tool?: {
-        case?: string;
-        value?: {
-          args?: {
-            name?: string;
-            toolName?: string;
-            toolCallId?: string;
-            args?: Record<string, Uint8Array>;
-          };
-        };
-      };
-    };
-  },
-  state: StreamState,
-): PendingExec | null {
-  const callId = update.callId ?? "";
-  const toolCase = update.toolCall?.tool?.case;
-  if (toolCase !== "mcpToolCall") return null;
-
-  const mcpArgs = update.toolCall?.tool?.value?.args;
-  if (!mcpArgs) return null;
-
-  const toolCallId = mcpArgs.toolCallId || callId || crypto.randomUUID();
-  const decodedMap = decodeMcpArgsMap(mcpArgs.args ?? {});
-  const partialArgsText = callId
-    ? state.interactionToolArgsText.get(callId)?.trim()
-    : undefined;
-
-  let decodedArgs = "{}";
-  if (Object.keys(decodedMap).length > 0) {
-    decodedArgs = JSON.stringify(decodedMap);
-  } else if (partialArgsText) {
-    decodedArgs = partialArgsText;
-  }
-
-  if (callId) state.interactionToolArgsText.delete(callId);
-
-  return {
-    execId: callId || toolCallId,
-    execMsgId: 0,
-    toolCallId,
-    toolName: mcpArgs.toolName || mcpArgs.name || "unknown_mcp_tool",
-    decodedArgs,
-    source: "interaction",
-    cursorCallId: callId || undefined,
-    modelCallId: update.modelCallId,
-  };
+  // Interaction tool-call updates are informational only. Resumable MCP tool
+  // execution comes from execServerMessage.mcpArgs.
 }
 
 function handleInteractionQuery(
@@ -763,7 +601,7 @@ function handleExecMessage(
       execMsgId: exec.execMsgId,
       decodedArgs: exec.decodedArgs,
     });
-    emitPendingExec(exec, state, onMcpExec);
+    onMcpExec(exec);
     return;
   }
 
