@@ -21,7 +21,12 @@ import {
 } from "../src/proto/agent_pb";
 
 type DiscoveryMode = "success" | "empty" | "auth-error";
-type RunSSEMode = "close-on-append" | "end-stream-hold" | "checkpoint-then-close" | "tool-call-pause" | "verbose-title-close";
+type RunSSEMode =
+  | "close-on-append"
+  | "end-stream-hold"
+  | "checkpoint-then-close"
+  | "tool-call-pause"
+  | "verbose-title-close";
 
 interface ObservedRunRequest {
   conversationId: string;
@@ -50,7 +55,9 @@ interface TestCursorBackend {
   apiUrl: string;
   refreshUrl: string;
   setDiscoveryMode: (mode: DiscoveryMode) => void;
-  setDiscoveredModels: (models: Array<{ id: string; name: string; reasoning?: boolean }>) => void;
+  setDiscoveredModels: (
+    models: Array<{ id: string; name: string; reasoning?: boolean }>,
+  ) => void;
   setRunSSEMode: (mode: RunSSEMode) => void;
   resetObservations: () => void;
   getDiscoveryAuthHeaders: () => string[];
@@ -68,7 +75,9 @@ function assert(condition: unknown, message: string): asserts condition {
 
 function assertEqual<T>(actual: T, expected: T, message: string): void {
   if (actual !== expected) {
-    throw new Error(`${message}: expected ${String(expected)}, got ${String(actual)}`);
+    throw new Error(
+      `${message}: expected ${String(expected)}, got ${String(actual)}`,
+    );
   }
 }
 
@@ -106,7 +115,10 @@ function frameConnectEndStreamMessage(payload: Uint8Array): Buffer {
   return frame;
 }
 
-function readVarint(bytes: Uint8Array, startOffset: number): { value: number; offset: number } {
+function readVarint(
+  bytes: Uint8Array,
+  startOffset: number,
+): { value: number; offset: number } {
   let value = 0;
   let shift = 0;
   let offset = startOffset;
@@ -124,7 +136,9 @@ function readVarint(bytes: Uint8Array, startOffset: number): { value: number; of
   throw new Error("Invalid varint");
 }
 
-function decodeObservedRunRequest(payload: Uint8Array): ObservedRunRequest | null {
+function decodeObservedRunRequest(
+  payload: Uint8Array,
+): ObservedRunRequest | null {
   if (payload.length === 0 || payload[0] !== 0x0a) return null;
 
   const { value: hexLength, offset } = readVarint(payload, 1);
@@ -141,10 +155,14 @@ function decodeObservedRunRequest(payload: Uint8Array): ObservedRunRequest | nul
   const runRequest = clientMessage.message.value;
   const action = runRequest.action?.action;
   const turns = (runRequest.conversationState?.turns ?? []).map((turnBytes) => {
-    const turnStructure = fromBinary(ConversationTurnStructureSchema, turnBytes);
-    const agentTurn = turnStructure.turn.case === "agentConversationTurn"
-      ? turnStructure.turn.value
-      : undefined;
+    const turnStructure = fromBinary(
+      ConversationTurnStructureSchema,
+      turnBytes,
+    );
+    const agentTurn =
+      turnStructure.turn.case === "agentConversationTurn"
+        ? turnStructure.turn.value
+        : undefined;
     const userText = agentTurn?.userMessage
       ? fromBinary(UserMessageSchema, agentTurn.userMessage).text
       : "";
@@ -164,9 +182,10 @@ function decodeObservedRunRequest(payload: Uint8Array): ObservedRunRequest | nul
   return {
     conversationId: runRequest.conversationId ?? "",
     turnCount: runRequest.conversationState?.turns.length ?? 0,
-    latestUserText: action?.case === "userMessageAction"
-      ? action.value.userMessage?.text ?? ""
-      : "",
+    latestUserText:
+      action?.case === "userMessageAction"
+        ? (action.value.userMessage?.text ?? "")
+        : "",
     turns,
     customSystemPrompt: runRequest.customSystemPrompt ?? "",
   };
@@ -195,7 +214,9 @@ function makeToolCallFrame(): Buffer {
       value: execMessage,
     },
   });
-  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
+  return frameConnectUnaryMessage(
+    toBinary(AgentServerMessageSchema, serverMessage),
+  );
 }
 
 function makeCheckpointUpdateFrame(): Buffer {
@@ -238,7 +259,9 @@ function makeCheckpointUpdateFrame(): Buffer {
       value: checkpoint,
     },
   });
-  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
+  return frameConnectUnaryMessage(
+    toBinary(AgentServerMessageSchema, serverMessage),
+  );
 }
 
 function makeTextDeltaFrame(text: string): Buffer {
@@ -253,15 +276,19 @@ function makeTextDeltaFrame(text: string): Buffer {
       } as any,
     },
   });
-  return frameConnectUnaryMessage(toBinary(AgentServerMessageSchema, serverMessage));
+  return frameConnectUnaryMessage(
+    toBinary(AgentServerMessageSchema, serverMessage),
+  );
 }
 
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let runSSEMode: RunSSEMode = "close-on-append";
-  let discoveredModels: Array<{ id: string; name: string; reasoning?: boolean }> = [
-    { id: "composer-2", name: "Composer 2", reasoning: true },
-  ];
+  let discoveredModels: Array<{
+    id: string;
+    name: string;
+    reasoning?: boolean;
+  }> = [{ id: "composer-2", name: "Composer 2", reasoning: true }];
   const discoveryAuthHeaders: string[] = [];
   const discoveryRequestBodies: Uint8Array[] = [];
   const refreshAuthHeaders: string[] = [];
@@ -293,7 +320,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       }),
     );
   });
-  await new Promise<void>((resolve) => refreshServer.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) =>
+    refreshServer.listen(0, "127.0.0.1", resolve),
+  );
   const refreshPort = (refreshServer.address() as AddressInfo).port;
 
   let pendingRunSSE: http.ServerResponse | null = null;
@@ -320,28 +349,34 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
 
         if (discoveryMode === "auth-error") {
           res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ code: "unauthenticated", message: "expired token" }));
+          res.end(
+            JSON.stringify({
+              code: "unauthenticated",
+              message: "expired token",
+            }),
+          );
           return;
         }
 
-        const responseBody = discoveryMode === "empty"
-          ? frameConnectUnaryMessage(new Uint8Array())
-          : frameConnectUnaryMessage(
-              toBinary(
-                GetUsableModelsResponseSchema,
-                create(GetUsableModelsResponseSchema, {
-                  models: discoveredModels.map((model) =>
-                    create(ModelDetailsSchema, {
-                      modelId: model.id,
-                      displayModelId: model.id,
-                      displayName: model.name,
-                      displayNameShort: model.name,
-                      aliases: [],
-                    }),
-                  ),
-                }),
-              ),
-            );
+        const responseBody =
+          discoveryMode === "empty"
+            ? frameConnectUnaryMessage(new Uint8Array())
+            : frameConnectUnaryMessage(
+                toBinary(
+                  GetUsableModelsResponseSchema,
+                  create(GetUsableModelsResponseSchema, {
+                    models: discoveredModels.map((model) =>
+                      create(ModelDetailsSchema, {
+                        modelId: model.id,
+                        displayModelId: model.id,
+                        displayName: model.name,
+                        displayNameShort: model.name,
+                        aliases: [],
+                      }),
+                    ),
+                  }),
+                ),
+              );
         res.writeHead(200, { "Content-Type": "application/connect+proto" });
         res.end(responseBody);
         return;
@@ -359,7 +394,10 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       }
 
       if (path === "/agent.v1.AgentService/NameAgent") {
-        const request = fromBinary(NameAgentRequestSchema, new Uint8Array(Buffer.concat(chunks)));
+        const request = fromBinary(
+          NameAgentRequestSchema,
+          new Uint8Array(Buffer.concat(chunks)),
+        );
         observedNameAgentRequests.push(request.userMessage);
         const responseBody = frameConnectUnaryMessage(
           toBinary(
@@ -376,7 +414,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
 
       if (path === "/aiserver.v1.BidiService/BidiAppend") {
         bidiAppendCount += 1;
-        const observed = decodeObservedRunRequest(new Uint8Array(Buffer.concat(chunks)));
+        const observed = decodeObservedRunRequest(
+          new Uint8Array(Buffer.concat(chunks)),
+        );
         if (observed) observedRunRequests.push(observed);
         res.writeHead(200, { "Content-Type": "application/proto" });
         res.end();
@@ -384,8 +424,14 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
         if (runSSEMode === "close-on-append" && pendingRunSSE) {
           pendingRunSSE.end();
           pendingRunSSE = null;
-        } else if (runSSEMode === "end-stream-hold" && pendingRunSSE && bidiAppendCount === 1) {
-          pendingRunSSE.write(frameConnectEndStreamMessage(new TextEncoder().encode("{}")));
+        } else if (
+          runSSEMode === "end-stream-hold" &&
+          pendingRunSSE &&
+          bidiAppendCount === 1
+        ) {
+          pendingRunSSE.write(
+            frameConnectEndStreamMessage(new TextEncoder().encode("{}")),
+          );
           setTimeout(() => {
             try {
               pendingRunSSE?.end();
@@ -397,7 +443,11 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           pendingRunSSE.end();
           pendingRunSSE = null;
         } else if (runSSEMode === "verbose-title-close" && pendingRunSSE) {
-          pendingRunSSE.write(makeTextDeltaFrame("# That depends on which fish you're looking for! If you're referring to the famous 1998 techno hit ..."));
+          pendingRunSSE.write(
+            makeTextDeltaFrame(
+              "# That depends on which fish you're looking for! If you're referring to the famous 1998 techno hit ...",
+            ),
+          );
           pendingRunSSE.end();
           pendingRunSSE = null;
         } else if (runSSEMode === "tool-call-pause" && pendingRunSSE) {
@@ -417,7 +467,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
       res.end();
     });
   });
-  await new Promise<void>((resolve) => apiServer.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) =>
+    apiServer.listen(0, "127.0.0.1", resolve),
+  );
   const apiPort = (apiServer.address() as AddressInfo).port;
 
   return {
@@ -520,10 +572,22 @@ async function testPluginLogging(modules: TestModules) {
   });
   await modules.flushPluginLogs();
 
-  assertEqual(logEntries.length, 1, "Expected one forwarded OpenCode log entry");
-  assertEqual(logEntries[0]?.body?.service, "opencode-cursor-oauth", "Expected plugin log service name");
+  assertEqual(
+    logEntries.length,
+    1,
+    "Expected one forwarded OpenCode log entry",
+  );
+  assertEqual(
+    logEntries[0]?.body?.service,
+    "opencode-cursor-oauth",
+    "Expected plugin log service name",
+  );
   assertEqual(logEntries[0]?.body?.level, "error", "Expected error log level");
-  assertEqual(logEntries[0]?.body?.message, "Logger smoke test", "Expected forwarded log message");
+  assertEqual(
+    logEntries[0]?.body?.message,
+    "Logger smoke test",
+    "Expected forwarded log message",
+  );
   assertEqual(
     logEntries[0]?.query?.directory,
     "/tmp/opencode-cursor-logger-test",
@@ -651,7 +715,9 @@ async function testProxyStartStop(modules: TestModules) {
     throw new Error(`Expected object=list, got ${modelsBody.object}`);
   }
   if (!Array.isArray(modelsBody.data) || modelsBody.data.length !== 0) {
-    throw new Error(`Expected empty model list data array, got ${JSON.stringify(modelsBody.data)}`);
+    throw new Error(
+      `Expected empty model list data array, got ${JSON.stringify(modelsBody.data)}`,
+    );
   }
   console.log("[test] /v1/models OK");
 
@@ -661,11 +727,15 @@ async function testProxyStartStop(modules: TestModules) {
     body: JSON.stringify({ model: "test", messages: [] }),
   });
   if (badRes.status !== 400) {
-    throw new Error(`Expected 400 for missing user message, got ${badRes.status}`);
+    throw new Error(
+      `Expected 400 for missing user message, got ${badRes.status}`,
+    );
   }
   const badBody = await badRes.json();
   if (!badBody.error?.message?.includes("No user message")) {
-    throw new Error(`Expected 'No user message' error, got: ${badBody.error?.message}`);
+    throw new Error(
+      `Expected 'No user message' error, got: ${badBody.error?.message}`,
+    );
   }
   console.log("[test] Missing user message validation OK");
 
@@ -686,7 +756,12 @@ async function testAuthParams(modules: TestModules) {
   console.log("[test] Generating auth params...");
   const params = await modules.generateCursorAuthParams();
 
-  if (!params.verifier || !params.challenge || !params.uuid || !params.loginUrl) {
+  if (
+    !params.verifier ||
+    !params.challenge ||
+    !params.uuid ||
+    !params.loginUrl
+  ) {
     throw new Error("Missing auth params");
   }
   if (!params.loginUrl.includes("cursor.com/loginDeepControl")) {
@@ -719,7 +794,9 @@ async function testTokenExpiry(modules: TestModules) {
   const expectedMax = futureExp * 1000 - 5 * 60 * 1000 + 1000;
 
   if (expiry < expectedMin || expiry > expectedMax) {
-    throw new Error(`Token expiry ${expiry} out of expected range [${expectedMin}, ${expectedMax}]`);
+    throw new Error(
+      `Token expiry ${expiry} out of expected range [${expectedMin}, ${expectedMax}]`,
+    );
   }
 
   const fallbackExpiry = modules.getTokenExpiry("not-a-jwt");
@@ -755,7 +832,9 @@ async function testPluginShape(modules: TestModules) {
     throw new Error("Plugin hooks.auth.methods missing or empty");
   }
   if (hooks.auth.methods[0].type !== "oauth") {
-    throw new Error(`Expected method type 'oauth', got '${hooks.auth.methods[0].type}'`);
+    throw new Error(
+      `Expected method type 'oauth', got '${hooks.auth.methods[0].type}'`,
+    );
   }
   if (typeof hooks.auth.methods[0].authorize !== "function") {
     throw new Error("Plugin auth method missing authorize function");
@@ -796,9 +875,7 @@ async function testArrayContentParsing(modules: TestModules) {
   if (res.status === 400) {
     const body = await res.json();
     if (body.error?.message?.includes("No user message")) {
-      throw new Error(
-        "Array content not normalized — plan mode messages lost",
-      );
+      throw new Error("Array content not normalized — plan mode messages lost");
     }
   }
 
@@ -824,7 +901,8 @@ async function testExpiredTokenRefreshBeforeDiscovery(
     refresh: "valid-refresh",
     expires: Date.now() - 10_000,
   };
-  const writes: Array<{ access: string; refresh: string; expires: number }> = [];
+  const writes: Array<{ access: string; refresh: string; expires: number }> =
+    [];
   const hooks = await modules.CursorAuthPlugin({
     client: {
       auth: {
@@ -852,7 +930,9 @@ async function testExpiredTokenRefreshBeforeDiscovery(
     "Expected refresh endpoint to be called with the stored refresh token",
   );
   assert(
-    backend.getDiscoveryAuthHeaders().every((header) => header === `Bearer ${writes[0]?.access}`),
+    backend
+      .getDiscoveryAuthHeaders()
+      .every((header) => header === `Bearer ${writes[0]?.access}`),
     `Expected discovery to use the refreshed token, got ${JSON.stringify(backend.getDiscoveryAuthHeaders())}`,
   );
   assertArrayEqual(
@@ -877,7 +957,8 @@ async function testDiscoveryFailureAndSuccess(
     refresh: "valid-refresh",
     expires: Date.now() + 3_600_000,
   };
-  const toasts: Array<{ title?: string; message: string; variant: string }> = [];
+  const toasts: Array<{ title?: string; message: string; variant: string }> =
+    [];
   const hooks = await modules.CursorAuthPlugin({
     client: {
       auth: {
@@ -903,8 +984,14 @@ async function testDiscoveryFailureAndSuccess(
     typeof degradedConfig === "object" && degradedConfig !== null,
     "Expected loader to return a disabled config when discovery fails",
   );
-  const degradedResponse = await degradedConfig.fetch("http://localhost/unused");
-  assertEqual(degradedResponse.status, 503, "Expected disabled config fetch to fail cleanly");
+  const degradedResponse = await degradedConfig.fetch(
+    "http://localhost/unused",
+  );
+  assertEqual(
+    degradedResponse.status,
+    503,
+    "Expected disabled config fetch to fail cleanly",
+  );
   const degradedBody = await degradedResponse.json();
   assert(
     degradedBody.error?.message?.includes("Cursor model discovery returned"),
@@ -915,7 +1002,11 @@ async function testDiscoveryFailureAndSuccess(
     [],
     "Expected failed discovery to clear provider models",
   );
-  assertEqual(toasts.length, 1, "Expected exactly one toast for discovery failure");
+  assertEqual(
+    toasts.length,
+    1,
+    "Expected exactly one toast for discovery failure",
+  );
   assert(
     toasts[0]?.message.includes("Cursor model discovery returned"),
     `Expected discovery failure message to be shown in a toast, got ${JSON.stringify(toasts)}`,
@@ -935,7 +1026,11 @@ async function testDiscoveryFailureAndSuccess(
     "Expected successful discovery to replace fallback models",
   );
   const discoveredModelsRes = await fetch(`${discoveredConfig.baseURL}/models`);
-  assertEqual(discoveredModelsRes.status, 200, "Expected discovered /v1/models to succeed");
+  assertEqual(
+    discoveredModelsRes.status,
+    200,
+    "Expected discovered /v1/models to succeed",
+  );
   const discoveredModelsBody = await discoveredModelsRes.json();
   assertArrayEqual(
     discoveredModelsBody.data.map((model: { id: string }) => model.id).sort(),
@@ -958,16 +1053,23 @@ async function testEndStreamStopsHeartbeats(
     backend.setRunSSEMode("end-stream-hold");
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
-    const response = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "composer-2",
-        messages: [{ role: "user", content: "hello" }],
-      }),
-    });
+    const response = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      },
+    );
 
-    assertEqual(response.status, 200, "Expected streaming chat completion to succeed");
+    assertEqual(
+      response.status,
+      200,
+      "Expected streaming chat completion to succeed",
+    );
     const body = await response.text();
     assert(
       body.includes("data: [DONE]"),
@@ -1004,30 +1106,48 @@ async function testSessionHeadersPreserveConversationState(
       "x-opencode-session-id": "ses-test-shared",
     };
 
-    const firstResponse = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: "composer-2",
-        messages: [{ role: "user", content: "first prompt" }],
-      }),
-    });
-    assertEqual(firstResponse.status, 200, "Expected first session request to succeed");
+    const firstResponse = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "composer-2",
+          messages: [{ role: "user", content: "first prompt" }],
+        }),
+      },
+    );
+    assertEqual(
+      firstResponse.status,
+      200,
+      "Expected first session request to succeed",
+    );
     await firstResponse.text();
 
-    const secondResponse = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: "composer-2",
-        messages: [{ role: "user", content: "follow up only" }],
-      }),
-    });
-    assertEqual(secondResponse.status, 200, "Expected follow-up session request to succeed");
+    const secondResponse = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "composer-2",
+          messages: [{ role: "user", content: "follow up only" }],
+        }),
+      },
+    );
+    assertEqual(
+      secondResponse.status,
+      200,
+      "Expected follow-up session request to succeed",
+    );
     await secondResponse.text();
 
     const observed = backend.getObservedRunRequests();
-    assertEqual(observed.length, 2, "Expected two observed Cursor run requests");
+    assertEqual(
+      observed.length,
+      2,
+      "Expected two observed Cursor run requests",
+    );
     assertEqual(
       observed[1]?.conversationId,
       observed[0]?.conversationId,
@@ -1088,7 +1208,10 @@ async function testAgentScopedSessionIsolation(
       body: JSON.stringify({
         model: "composer-2",
         messages: [
-          { role: "user", content: "Generate a title for this conversation:\n" },
+          {
+            role: "user",
+            content: "Generate a title for this conversation:\n",
+          },
           { role: "user", content: "generate a short title" },
         ],
       }),
@@ -1104,9 +1227,17 @@ async function testAgentScopedSessionIsolation(
     }).then((response) => response.text());
 
     const observed = backend.getObservedRunRequests();
-    assertEqual(observed.length, 2, "Expected only build-agent requests to use Cursor RunSSE");
+    assertEqual(
+      observed.length,
+      2,
+      "Expected only build-agent requests to use Cursor RunSSE",
+    );
     const titleRequests = backend.getObservedNameAgentRequests();
-    assertEqual(titleRequests.length, 1, "Expected title agent request to use Cursor NameAgent");
+    assertEqual(
+      titleRequests.length,
+      1,
+      "Expected title agent request to use Cursor NameAgent",
+    );
     assert(
       titleRequests[0]?.includes("generate a short title"),
       `Expected title agent naming request to include title source text, got ${JSON.stringify(titleRequests)}`,
@@ -1165,7 +1296,11 @@ async function testModelSwitchPreservesConversationState(
     }).then((response) => response.text());
 
     const observed = backend.getObservedRunRequests();
-    assertEqual(observed.length, 2, "Expected two observed Cursor run requests");
+    assertEqual(
+      observed.length,
+      2,
+      "Expected two observed Cursor run requests",
+    );
     assertEqual(
       observed[1]?.conversationId,
       observed[0]?.conversationId,
@@ -1196,41 +1331,51 @@ async function testProviderSwitchHistoryReconstruction(
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
 
-    const response = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "composer-2",
-        stream: false,
-        messages: [
-          { role: "system", content: "You are a helpful assistant." },
-          { role: "user", content: "inspect the config" },
-          {
-            role: "assistant",
-            content: "I will inspect the config file.",
-            tool_calls: [
-              {
-                id: "call-read-1",
-                type: "function",
-                function: {
-                  name: "read_file",
-                  arguments: JSON.stringify({ path: "opencode.json" }),
+    const response = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2",
+          stream: false,
+          messages: [
+            { role: "system", content: "You are a helpful assistant." },
+            { role: "user", content: "inspect the config" },
+            {
+              role: "assistant",
+              content: "I will inspect the config file.",
+              tool_calls: [
+                {
+                  id: "call-read-1",
+                  type: "function",
+                  function: {
+                    name: "read_file",
+                    arguments: JSON.stringify({ path: "opencode.json" }),
+                  },
                 },
-              },
-            ],
-          },
-          {
-            role: "tool",
-            tool_call_id: "call-read-1",
-            content: '{"model":"anthropic/claude-sonnet-4-5"}',
-          },
-          { role: "assistant", content: "The config currently uses an Anthropic model." },
-          { role: "user", content: "switch this session to cursor" },
-        ],
-      }),
-    });
+              ],
+            },
+            {
+              role: "tool",
+              tool_call_id: "call-read-1",
+              content: '{"model":"anthropic/claude-sonnet-4-5"}',
+            },
+            {
+              role: "assistant",
+              content: "The config currently uses an Anthropic model.",
+            },
+            { role: "user", content: "switch this session to cursor" },
+          ],
+        }),
+      },
+    );
 
-    assertEqual(response.status, 200, "Expected reconstructed provider-switch request to succeed");
+    assertEqual(
+      response.status,
+      200,
+      "Expected reconstructed provider-switch request to succeed",
+    );
     const observed = backend.getObservedRunRequests();
     assertEqual(observed.length, 1, "Expected one observed Cursor run request");
     assertEqual(
@@ -1247,23 +1392,31 @@ async function testProviderSwitchHistoryReconstruction(
       `Expected latest user text to include the prior user prompt, got ${JSON.stringify(observed[0])}`,
     );
     assert(
-      observed[0]?.latestUserText.includes("Assistant: I will inspect the config file."),
+      observed[0]?.latestUserText.includes(
+        "Assistant: I will inspect the config file.",
+      ),
       `Expected latest user text to include the prior assistant reply, got ${JSON.stringify(observed[0])}`,
     );
     assert(
-      observed[0]?.latestUserText.includes("[assistant requested tool read_file id=call-read-1]"),
+      observed[0]?.latestUserText.includes(
+        "[assistant requested tool read_file id=call-read-1]",
+      ),
       `Expected reconstructed assistant history to include the prior tool call, got ${JSON.stringify(observed[0])}`,
     );
     assert(
-      observed[0]?.latestUserText.includes('[tool result id=call-read-1]'),
+      observed[0]?.latestUserText.includes("[tool result id=call-read-1]"),
       `Expected reconstructed assistant history to include the prior tool result, got ${JSON.stringify(observed[0])}`,
     );
     assert(
-      observed[0]?.latestUserText.includes("The config currently uses an Anthropic model."),
+      observed[0]?.latestUserText.includes(
+        "The config currently uses an Anthropic model.",
+      ),
       `Expected reconstructed assistant history to preserve the prior assistant reply, got ${JSON.stringify(observed[0])}`,
     );
     assert(
-      observed[0]?.latestUserText.includes("Latest user message:\nswitch this session to cursor"),
+      observed[0]?.latestUserText.includes(
+        "Latest user message:\nswitch this session to cursor",
+      ),
       `Expected latest user message to remain present at the end of the handoff prompt, got ${JSON.stringify(observed[0])}`,
     );
   } finally {
@@ -1285,24 +1438,38 @@ async function testPlainTextProviderSwitchHandoff(
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
 
-    const response = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "composer-2",
-        stream: false,
-        messages: [
-          { role: "user", content: "Respond with Hi" },
-          { role: "assistant", content: "Hi" },
-          { role: "user", content: "What was the first prompt in this session?" },
-        ],
-      }),
-    });
+    const response = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2",
+          stream: false,
+          messages: [
+            { role: "user", content: "Respond with Hi" },
+            { role: "assistant", content: "Hi" },
+            {
+              role: "user",
+              content: "What was the first prompt in this session?",
+            },
+          ],
+        }),
+      },
+    );
 
-    assertEqual(response.status, 200, "Expected plain-text handoff request to succeed");
+    assertEqual(
+      response.status,
+      200,
+      "Expected plain-text handoff request to succeed",
+    );
     const observed = backend.getObservedRunRequests();
     assertEqual(observed.length, 1, "Expected one observed Cursor run request");
-    assertEqual(observed[0]?.turnCount, 0, "Expected plain-text handoff to flatten prior turns into the latest prompt");
+    assertEqual(
+      observed[0]?.turnCount,
+      0,
+      "Expected plain-text handoff to flatten prior turns into the latest prompt",
+    );
     assert(
       observed[0]?.latestUserText.includes("User: Respond with Hi"),
       `Expected handoff prompt to include the first user message, got ${JSON.stringify(observed[0])}`,
@@ -1312,7 +1479,9 @@ async function testPlainTextProviderSwitchHandoff(
       `Expected handoff prompt to include the prior assistant reply, got ${JSON.stringify(observed[0])}`,
     );
     assert(
-      observed[0]?.latestUserText.includes("Latest user message:\nWhat was the first prompt in this session?"),
+      observed[0]?.latestUserText.includes(
+        "Latest user message:\nWhat was the first prompt in this session?",
+      ),
       `Expected handoff prompt to end with the latest user message, got ${JSON.stringify(observed[0])}`,
     );
   } finally {
@@ -1334,49 +1503,65 @@ async function testSystemPromptForwardedToCursorRunRequest(
     modules.stopProxy();
     const proxyPort = await modules.startProxy(async () => "test-token");
 
-    const response = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-opencode-session-id": "ses-title-agent",
+    const response = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-opencode-session-id": "ses-title-agent",
+        },
+        body: JSON.stringify({
+          model: "composer-2",
+          stream: false,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a title generator. You output ONLY a thread title. Nothing else.",
+            },
+            {
+              role: "user",
+              content: "Generate a title for this conversation:\n",
+            },
+            {
+              role: "user",
+              content: "What determines fish prices in Tokyo markets?",
+            },
+          ],
+        }),
       },
-      body: JSON.stringify({
-        model: "composer-2",
-        stream: false,
-        messages: [
-          {
-            role: "system",
-            content: "You are a title generator. You output ONLY a thread title. Nothing else.",
-          },
-          {
-            role: "user",
-            content: "Generate a title for this conversation:\n",
-          },
-          {
-            role: "user",
-            content: "What determines fish prices in Tokyo markets?",
-          },
-        ],
-      }),
-    });
+    );
 
     assertEqual(response.status, 200, "Expected title-like request to succeed");
-    const body = await response.json() as { choices?: Array<{ message?: { content?: string | null } }> };
+    const body = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string | null } }>;
+    };
     assertEqual(
       body.choices?.[0]?.message?.content,
       "Fish Price Question",
       "Expected title request to use Cursor's naming RPC response",
     );
     const observed = backend.getObservedRunRequests();
-    assertEqual(observed.length, 0, "Expected title request marker to bypass Cursor RunSSE chat requests");
+    assertEqual(
+      observed.length,
+      0,
+      "Expected title request marker to bypass Cursor RunSSE chat requests",
+    );
     const nameRequests = backend.getObservedNameAgentRequests();
-    assertEqual(nameRequests.length, 1, "Expected one observed NameAgent request");
+    assertEqual(
+      nameRequests.length,
+      1,
+      "Expected one observed NameAgent request",
+    );
     assert(
       !nameRequests[0]?.includes("Generate a title for this conversation:"),
       `Expected NameAgent request to omit the OpenCode title marker, got ${JSON.stringify(nameRequests)}`,
     );
     assert(
-      nameRequests[0]?.includes("What determines fish prices in Tokyo markets?"),
+      nameRequests[0]?.includes(
+        "What determines fish prices in Tokyo markets?",
+      ),
       `Expected NameAgent request to include the title source text, got ${JSON.stringify(nameRequests)}`,
     );
   } finally {
@@ -1391,7 +1576,9 @@ async function testPendingToolResultResumeAcrossModelSwitch(
   modules: TestModules,
   backend: TestCursorBackend,
 ) {
-  console.log("[test] Testing pending tool result resume across model switch...");
+  console.log(
+    "[test] Testing pending tool result resume across model switch...",
+  );
 
   try {
     backend.resetObservations();
@@ -1404,51 +1591,67 @@ async function testPendingToolResultResumeAcrossModelSwitch(
       "x-opencode-agent": "build",
     };
 
-    const firstResponse = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: "composer-2",
-        messages: [{ role: "user", content: "use a tool to inspect the file" }],
-      }),
-    });
-    assertEqual(firstResponse.status, 200, "Expected initial tool-call request to succeed");
+    const firstResponse = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "composer-2",
+          messages: [
+            { role: "user", content: "use a tool to inspect the file" },
+          ],
+        }),
+      },
+    );
+    assertEqual(
+      firstResponse.status,
+      200,
+      "Expected initial tool-call request to succeed",
+    );
     const firstBody = await firstResponse.text();
     assert(
       firstBody.includes('"finish_reason":"tool_calls"'),
       `Expected initial response to pause for tool calls, got ${JSON.stringify(firstBody)}`,
     );
 
-    const secondResponse = await fetch(`http://localhost:${proxyPort}/v1/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: "composer-2-fast",
-        messages: [
-          { role: "user", content: "use a tool to inspect the file" },
-          {
-            role: "assistant",
-            content: null,
-            tool_calls: [
-              {
-                id: "call-1",
-                type: "function",
-                function: {
-                  name: "read_file",
-                  arguments: JSON.stringify({ path: "src/index.ts" }),
+    const secondResponse = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "composer-2-fast",
+          messages: [
+            { role: "user", content: "use a tool to inspect the file" },
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call-1",
+                  type: "function",
+                  function: {
+                    name: "read_file",
+                    arguments: JSON.stringify({ path: "src/index.ts" }),
+                  },
                 },
-              },
-            ],
-          },
-          {
-            role: "tool",
-            tool_call_id: "call-1",
-            content: "file contents",
-          },
-        ],
-      }),
-    });
-    assertEqual(secondResponse.status, 200, "Expected resumed request to succeed after model switch");
+              ],
+            },
+            {
+              role: "tool",
+              tool_call_id: "call-1",
+              content: "file contents",
+            },
+          ],
+        }),
+      },
+    );
+    assertEqual(
+      secondResponse.status,
+      200,
+      "Expected resumed request to succeed after model switch",
+    );
     const secondBody = await secondResponse.text();
     assert(
       secondBody.includes("data: [DONE]"),

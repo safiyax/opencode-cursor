@@ -98,7 +98,8 @@ function writeConsoleLog(
   extra: Record<string, unknown>,
 ): void {
   const prefix = `[${PLUGIN_LOG_SERVICE}] ${message}`;
-  const suffix = Object.keys(extra).length > 0 ? ` ${JSON.stringify(extra)}` : "";
+  const suffix =
+    Object.keys(extra).length > 0 ? ` ${JSON.stringify(extra)}` : "";
 
   if (level === "error") {
     console.error(`${prefix}${suffix}`);
@@ -120,7 +121,8 @@ function serializeValue(
   if (valueType === "number" || valueType === "boolean") return value;
   if (valueType === "bigint") return value.toString();
   if (valueType === "symbol") return String(value);
-  if (valueType === "function") return `[function ${(value as Function).name || "anonymous"}]`;
+  if (valueType === "function")
+    return `[function ${(value as Function).name || "anonymous"}]`;
 
   if (value instanceof URL) return value.toString();
   if (value instanceof Headers) return Object.fromEntries(value.entries());
@@ -137,7 +139,9 @@ function serializeValue(
   }
   if (Array.isArray(value)) {
     if (depth >= 3) return `[array(${value.length})]`;
-    return value.slice(0, MAX_ARRAY_LENGTH).map((entry) => serializeValue(entry, depth + 1, seen));
+    return value
+      .slice(0, MAX_ARRAY_LENGTH)
+      .map((entry) => serializeValue(entry, depth + 1, seen));
   }
 
   if (typeof value === "object") {
@@ -148,9 +152,15 @@ function serializeValue(
       return `[object ${value.constructor?.name || "Object"}]`;
     }
 
-    const entries = Object.entries(value as Record<string, unknown>).slice(0, MAX_OBJECT_KEYS);
+    const entries = Object.entries(value as Record<string, unknown>).slice(
+      0,
+      MAX_OBJECT_KEYS,
+    );
     return Object.fromEntries(
-      entries.map(([key, entry]) => [key, serializeValue(entry, depth + 1, seen)]),
+      entries.map(([key, entry]) => [
+        key,
+        serializeValue(entry, depth + 1, seen),
+      ]),
     );
   }
 

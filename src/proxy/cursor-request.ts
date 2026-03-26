@@ -1,0 +1,122 @@
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { createHash } from "node:crypto";
+import {
+  AgentClientMessageSchema,
+  AgentRunRequestSchema,
+  ConversationActionSchema,
+  ConversationStateStructureSchema,
+  ConversationStepSchema,
+  AgentConversationTurnStructureSchema,
+  ConversationTurnStructureSchema,
+  AssistantMessageSchema,
+  ModelDetailsSchema,
+  UserMessageActionSchema,
+  UserMessageSchema,
+} from "../proto/agent_pb";
+import type { CursorRequestPayload } from "./types";
+
+export function buildCursorRequest(
+  modelId: string,
+  systemPrompt: string,
+  userText: string,
+  turns: Array<{ userText: string; assistantText: string }>,
+  conversationId: string,
+  checkpoint: Uint8Array | null,
+  existingBlobStore?: Map<string, Uint8Array>,
+): CursorRequestPayload {
+  const blobStore = new Map<string, Uint8Array>(existingBlobStore ?? []);
+
+  // System prompt → blob store (Cursor requests it back via KV handshake)
+  const systemJson = JSON.stringify({ role: "system", content: systemPrompt });
+  const systemBytes = new TextEncoder().encode(systemJson);
+  const systemBlobId = new Uint8Array(
+    createHash("sha256").update(systemBytes).digest(),
+  );
+  blobStore.set(Buffer.from(systemBlobId).toString("hex"), systemBytes);
+
+  let conversationState;
+  if (checkpoint) {
+    conversationState = fromBinary(
+      ConversationStateStructureSchema,
+      checkpoint,
+    );
+  } else {
+    const turnBytes: Uint8Array[] = [];
+    for (const turn of turns) {
+      const userMsg = create(UserMessageSchema, {
+        text: turn.userText,
+        messageId: crypto.randomUUID(),
+      });
+      const userMsgBytes = toBinary(UserMessageSchema, userMsg);
+
+      const stepBytes: Uint8Array[] = [];
+      if (turn.assistantText) {
+        const step = create(ConversationStepSchema, {
+          message: {
+            case: "assistantMessage",
+            value: create(AssistantMessageSchema, { text: turn.assistantText }),
+          },
+        });
+        stepBytes.push(toBinary(ConversationStepSchema, step));
+      }
+
+      const agentTurn = create(AgentConversationTurnStructureSchema, {
+        userMessage: userMsgBytes,
+        steps: stepBytes,
+      });
+      const turnStructure = create(ConversationTurnStructureSchema, {
+        turn: { case: "agentConversationTurn", value: agentTurn },
+      });
+      turnBytes.push(toBinary(ConversationTurnStructureSchema, turnStructure));
+    }
+
+    conversationState = create(ConversationStateStructureSchema, {
+      rootPromptMessagesJson: [systemBlobId],
+      turns: turnBytes,
+      todos: [],
+      pendingToolCalls: [],
+      previousWorkspaceUris: [],
+      fileStates: {},
+      fileStatesV2: {},
+      summaryArchives: [],
+      turnTimings: [],
+      subagentStates: {},
+      selfSummaryCount: 0,
+      readPaths: [],
+    });
+  }
+
+  const userMessage = create(UserMessageSchema, {
+    text: userText,
+    messageId: crypto.randomUUID(),
+  });
+  const action = create(ConversationActionSchema, {
+    action: {
+      case: "userMessageAction",
+      value: create(UserMessageActionSchema, { userMessage }),
+    },
+  });
+
+  const modelDetails = create(ModelDetailsSchema, {
+    modelId,
+    displayModelId: modelId,
+    displayName: modelId,
+  });
+
+  const runRequest = create(AgentRunRequestSchema, {
+    conversationState,
+    action,
+    modelDetails,
+    conversationId,
+  });
+
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "runRequest", value: runRequest },
+  });
+
+  return {
+    requestBytes: toBinary(AgentClientMessageSchema, clientMessage),
+    blobStore,
+    mcpTools: [],
+  };
+}

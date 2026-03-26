@@ -25,7 +25,6 @@ export interface CursorCredentials {
   expires: number;
 }
 
-
 export async function generateCursorAuthParams(): Promise<CursorAuthParams> {
   const { verifier, challenge } = await generatePKCE();
   const uuid = crypto.randomUUID();
@@ -141,7 +140,6 @@ export async function refreshCursorToken(
   };
 }
 
-
 /**
  * Extract JWT expiry with 5-minute safety margin.
  * Falls back to 1 hour from now if token can't be parsed.
@@ -162,7 +160,6 @@ export function getTokenExpiry(token: string): number {
     ) {
       return decoded.exp * 1000 - 5 * 60 * 1000;
     }
-  } catch {
-  }
+  } catch {}
   return Date.now() + 3600 * 1000;
 }

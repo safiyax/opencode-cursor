@@ -1,7 +1,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
+import { callCursorUnaryRpc, decodeConnectUnaryBody } from "./cursor";
 import { errorDetails, logPluginError, logPluginWarn } from "./logger";
-import { callCursorUnaryRpc } from "./proxy";
 import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
@@ -47,9 +47,7 @@ export class CursorModelDiscoveryError extends Error {
   }
 }
 
-async function fetchCursorUsableModels(
-  apiKey: string,
-): Promise<CursorModel[]> {
+async function fetchCursorUsableModels(apiKey: string): Promise<CursorModel[]> {
   try {
     const requestPayload = create(GetUsableModelsRequestSchema, {});
     const requestBody = toBinary(GetUsableModelsRequestSchema, requestPayload);
@@ -122,9 +120,7 @@ async function fetchCursorUsableModels(
 
 let cachedModels: CursorModel[] | null = null;
 
-export async function getCursorModels(
-  apiKey: string,
-): Promise<CursorModel[]> {
+export async function getCursorModels(apiKey: string): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
   const discovered = await fetchCursorUsableModels(apiKey);
   cachedModels = discovered;
@@ -138,9 +134,10 @@ export function clearModelCache(): void {
 
 function buildDiscoveryHttpError(exitCode: number, body: Uint8Array): string {
   const detail = extractDiscoveryErrorDetail(body);
-  const protocolHint = exitCode === 464
-    ? " Likely protocol mismatch: Cursor appears to expect an HTTP/2 Connect unary request."
-    : "";
+  const protocolHint =
+    exitCode === 464
+      ? " Likely protocol mismatch: Cursor appears to expect an HTTP/2 Connect unary request."
+      : "";
   if (!detail) {
     return `Cursor model discovery failed with HTTP ${exitCode}.${protocolHint}`;
   }
@@ -156,11 +153,12 @@ function extractDiscoveryErrorDetail(body: Uint8Array): string | null {
   try {
     const parsed = JSON.parse(text) as { code?: unknown; message?: unknown };
     const code = typeof parsed.code === "string" ? parsed.code : undefined;
-    const message = typeof parsed.message === "string" ? parsed.message : undefined;
+    const message =
+      typeof parsed.message === "string" ? parsed.message : undefined;
     if (message && code) return `${message} (${code})`;
     if (message) return message;
     if (code) return code;
-  } catch { }
+  } catch {}
 
   return text.length > 200 ? `${text.slice(0, 197)}...` : text;
 }
@@ -181,38 +179,7 @@ function decodeGetUsableModelsResponse(payload: Uint8Array): {
   }
 }
 
-function decodeConnectUnaryBody(payload: Uint8Array): Uint8Array | null {
-  if (payload.length < 5) return null;
-
-  let offset = 0;
-  while (offset + 5 <= payload.length) {
-    const flags = payload[offset]!;
-    const view = new DataView(
-      payload.buffer,
-      payload.byteOffset + offset,
-      payload.byteLength - offset,
-    );
-    const messageLength = view.getUint32(1, false);
-    const frameEnd = offset + 5 + messageLength;
-    if (frameEnd > payload.length) return null;
-
-    // Compression flag
-    if ((flags & 0b0000_0001) !== 0) return null;
-
-    // End-of-stream flag — skip trailer frames
-    if ((flags & 0b0000_0010) === 0) {
-      return payload.subarray(offset + 5, frameEnd);
-    }
-
-    offset = frameEnd;
-  }
-
-  return null;
-}
-
-function normalizeCursorModels(
-  models: readonly unknown[],
-): CursorModel[] {
+function normalizeCursorModels(models: readonly unknown[]): CursorModel[] {
   if (models.length === 0) return [];
 
   const byId = new Map<string, CursorModel>();
@@ -240,7 +207,10 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
   };
 }
 
-function pickDisplayName(model: CursorModelDetails, fallbackId: string): string {
+function pickDisplayName(
+  model: CursorModelDetails,
+  fallbackId: string,
+): string {
   const candidates = [
     model.displayName,
     model.displayNameShort,

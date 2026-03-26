@@ -1,4 +1,7 @@
-export async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
+export async function generatePKCE(): Promise<{
+  verifier: string;
+  challenge: string;
+}> {
   const verifierBytes = new Uint8Array(96);
   crypto.getRandomValues(verifierBytes);
   const verifier = Buffer.from(verifierBytes).toString("base64url");
