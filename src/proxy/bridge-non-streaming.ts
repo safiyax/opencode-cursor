@@ -129,6 +129,7 @@ async function collectFullResponse(
             },
             (checkpointBytes) =>
               updateConversationCheckpoint(convKey, checkpointBytes),
+            () => scheduleBridgeEnd(bridge),
             (info) => {
               endStreamError = new Error(
                 `Cursor requested unsupported exec type: ${info.execCase}`,

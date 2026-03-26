@@ -24,6 +24,7 @@ type DiscoveryMode = "success" | "empty" | "auth-error";
 type RunSSEMode =
   | "close-on-append"
   | "end-stream-hold"
+  | "turn-ended-hold"
   | "checkpoint-then-close"
   | "tool-call-pause"
   | "unsupported-exec-pause"
@@ -298,6 +299,23 @@ function makeTextDeltaFrame(text: string): Buffer {
   );
 }
 
+function makeTurnEndedFrame(): Buffer {
+  const serverMessage = create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: {
+        message: {
+          case: "turnEnded",
+          value: {},
+        },
+      } as any,
+    },
+  });
+  return frameConnectUnaryMessage(
+    toBinary(AgentServerMessageSchema, serverMessage),
+  );
+}
+
 async function createTestCursorBackend(): Promise<TestCursorBackend> {
   let discoveryMode: DiscoveryMode = "success";
   let runSSEMode: RunSSEMode = "close-on-append";
@@ -464,6 +482,9 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
           pendingRunSSE.write(makeCheckpointUpdateFrame());
           pendingRunSSE.end();
           pendingRunSSE = null;
+        } else if (runSSEMode === "turn-ended-hold" && pendingRunSSE) {
+          pendingRunSSE.write(makeTextDeltaFrame("completed response"));
+          pendingRunSSE.write(makeTurnEndedFrame());
         } else if (runSSEMode === "verbose-title-close" && pendingRunSSE) {
           pendingRunSSE.write(
             makeTextDeltaFrame(
@@ -1123,6 +1144,58 @@ async function testEndStreamStopsHeartbeats(
   console.log("[test] Connect end-stream bridge shutdown OK");
 }
 
+async function testTurnEndedStopsStreamingResponse(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing turn-ended bridge shutdown...");
+
+  try {
+    backend.resetObservations();
+    backend.setRunSSEMode("turn-ended-hold");
+    modules.stopProxy();
+    const proxyPort = await modules.startProxy(async () => "test-token");
+    const response = await fetch(
+      `http://localhost:${proxyPort}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "composer-2",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      },
+    );
+
+    assertEqual(
+      response.status,
+      200,
+      "Expected streaming chat completion to succeed",
+    );
+    const body = await response.text();
+    assert(
+      body.includes('"finish_reason":"stop"'),
+      `Expected SSE stream to emit a stop chunk after turn-ended, got ${JSON.stringify(body)}`,
+    );
+    assert(
+      body.includes("data: [DONE]"),
+      `Expected SSE stream to terminate after turn-ended, got ${JSON.stringify(body)}`,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 5_500));
+    assertEqual(
+      backend.getBidiAppendCount(),
+      1,
+      "Expected proxy to stop heartbeats after receiving turn-ended",
+    );
+  } finally {
+    modules.stopProxy();
+    backend.setRunSSEMode("close-on-append");
+  }
+
+  console.log("[test] Turn-ended bridge shutdown OK");
+}
+
 async function testSessionHeadersPreserveConversationState(
   modules: TestModules,
   backend: TestCursorBackend,
@@ -1778,6 +1851,7 @@ async function main() {
     await testPendingToolResultResumeAcrossModelSwitch(modules, backend);
     await testUnsupportedExecFailsFast(modules, backend);
     await testEndStreamStopsHeartbeats(modules, backend);
+    await testTurnEndedStopsStreamingResponse(modules, backend);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFailureAndSuccess(modules, backend);
     console.log("\n✓ All smoke tests passed");

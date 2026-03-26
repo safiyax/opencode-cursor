@@ -192,12 +192,13 @@ export function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  onTurnEnded?: () => void,
   onUnhandledExec?: (info: UnhandledExecInfo) => void,
 ): void {
   const msgCase = msg.message.case;
 
   if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, state, onText);
+    handleInteractionUpdate(msg.message.value, state, onText, onTurnEnded);
   } else if (msgCase === "kvServerMessage") {
     handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
   } else if (msgCase === "execServerMessage") {
@@ -223,6 +224,7 @@ function handleInteractionUpdate(
   update: any,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
+  onTurnEnded?: () => void,
 ): void {
   const updateCase = update.message?.case;
 
@@ -234,6 +236,8 @@ function handleInteractionUpdate(
     if (delta) onText(delta, true);
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
+  } else if (updateCase === "turnEnded") {
+    onTurnEnded?.();
   }
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec
