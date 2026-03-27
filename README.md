@@ -37,6 +37,13 @@ Install or update dependencies the way you normally do for OpenCode plugins (e.g
 
 If something fails, check that you are signed into the correct Cursor account and that your plan includes the models you expect.
 
+## Compatibiliy Notes
+
+Cursor is not a raw model endpoint like the others supported in Opencode. It brings its own system prompt tools and mechanics.
+This plugin does try its best to make mcps, skills etc installed in Opencode work in Cursor.
+
+There are some issues with Cursors system prompt in this environment tho. Cursor adds various tools to the agent which opencode does not have, hence when the agent calls these they will be rejected which can sometimes lead to the agent no longer responding. Am still looking for a way to fix this, till then when the agent stops responding for a while interrupt it and tell it to continue again.
+
 ## Stability and issues
 
 This integration can be **buggy** or break when Cursor or OpenCode change their APIs or UI.
