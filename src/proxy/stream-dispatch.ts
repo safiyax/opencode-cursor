@@ -66,11 +66,11 @@ export interface UnhandledExecInfo {
 
 export interface UnsupportedServerMessageInfo {
   category:
-    | "agentMessage"
-    | "interactionUpdate"
-    | "interactionQuery"
-    | "execServerControl"
-    | "toolCall";
+  | "agentMessage"
+  | "interactionUpdate"
+  | "interactionQuery"
+  | "execServerControl"
+  | "toolCall";
   caseName: string;
   detail?: string;
 }
@@ -573,6 +573,7 @@ function handleExecMessage(
       projectLayouts: [],
       mcpInstructions: [],
       cloudRule,
+      webSearchEnabled: false,
       fileContents: {},
       customSubagents: [],
     });
