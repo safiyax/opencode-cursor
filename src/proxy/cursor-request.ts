@@ -13,6 +13,7 @@ import {
   UserMessageActionSchema,
   UserMessageSchema,
 } from "../proto/agent_pb";
+import { appendBundledAgentsRule } from "../agent-rules";
 import type { CursorRequestPayload } from "./types";
 
 export function buildCursorRequest(
@@ -167,5 +168,5 @@ function buildRunRequest(
 
 function buildCloudRule(systemPrompt: string): CursorRequestPayload["cloudRule"] {
   const content = systemPrompt.trim();
-  return content || undefined;
+  return appendBundledAgentsRule(content || undefined);
 }
