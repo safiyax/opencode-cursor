@@ -21,6 +21,8 @@ import {
 } from "./stream-dispatch";
 import { createBridgeCloseController } from "./bridge-close-controller";
 
+const MCP_TOOL_BATCH_WINDOW_MS = 75;
+
 interface CollectedResponse {
   text: string;
   usage: {
@@ -85,12 +87,25 @@ async function collectFullResponse(
   let fullText = "";
   let endStreamError: Error | null = null;
   const pendingToolCalls: OpenAIToolCall[] = [];
+  let toolCallEndTimer: NodeJS.Timeout | undefined;
 
   const { bridge, heartbeatTimer } = await startBridge(
     accessToken,
     payload.requestBytes,
   );
   const bridgeCloseController = createBridgeCloseController(bridge);
+  const stopToolCallEndTimer = () => {
+    if (!toolCallEndTimer) return;
+    clearTimeout(toolCallEndTimer);
+    toolCallEndTimer = undefined;
+  };
+  const scheduleToolCallBridgeEnd = () => {
+    stopToolCallEndTimer();
+    toolCallEndTimer = setTimeout(
+      () => scheduleBridgeEnd(bridge),
+      MCP_TOOL_BATCH_WINDOW_MS,
+    );
+  };
   const state: StreamState = {
     toolCallIndex: 0,
     pendingExecs: [],
@@ -120,15 +135,23 @@ async function collectFullResponse(
               fullText += content;
             },
             (exec) => {
-              pendingToolCalls.push({
+              const toolCall = {
                 id: exec.toolCallId,
-                type: "function",
+                type: "function" as const,
                 function: {
                   name: exec.toolName,
                   arguments: exec.decodedArgs,
                 },
-              });
-              scheduleBridgeEnd(bridge);
+              };
+              const existingIndex = pendingToolCalls.findIndex(
+                (call) => call.id === exec.toolCallId,
+              );
+              if (existingIndex >= 0) {
+                pendingToolCalls[existingIndex] = toolCall;
+              } else {
+                pendingToolCalls.push(toolCall);
+              }
+              scheduleToolCallBridgeEnd();
             },
             (checkpointBytes) => {
               updateConversationCheckpoint(convKey, checkpointBytes);
@@ -191,6 +214,7 @@ async function collectFullResponse(
 
   bridge.onClose(() => {
     bridgeCloseController.dispose();
+    stopToolCallEndTimer();
     clearInterval(heartbeatTimer);
     syncStoredBlobStore(convKey, payload.blobStore);
 

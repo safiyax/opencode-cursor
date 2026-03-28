@@ -46,6 +46,7 @@ import {
 import { createBridgeCloseController } from "./bridge-close-controller";
 
 const SSE_KEEPALIVE_INTERVAL_MS = 15_000;
+const MCP_TOOL_BATCH_WINDOW_MS = 75;
 
 function createBridgeStreamResponse(
   bridge: CursorSession,
@@ -61,12 +62,18 @@ function createBridgeStreamResponse(
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
   let keepaliveTimer: NodeJS.Timeout | undefined;
+  let toolCallFlushTimer: NodeJS.Timeout | undefined;
   const bridgeCloseController = createBridgeCloseController(bridge);
 
   const stopKeepalive = () => {
     if (!keepaliveTimer) return;
     clearInterval(keepaliveTimer);
     keepaliveTimer = undefined;
+  };
+  const stopToolCallFlushTimer = () => {
+    if (!toolCallFlushTimer) return;
+    clearTimeout(toolCallFlushTimer);
+    toolCallFlushTimer = undefined;
   };
 
   const stream = new ReadableStream({
@@ -83,6 +90,7 @@ function createBridgeStreamResponse(
       let assistantText = metadata.assistantSeedText ?? "";
       let mcpExecReceived = false;
       let endStreamError: Error | null = null;
+      let toolCallsFlushed = false;
 
       const sendSSE = (data: object) => {
         if (closed) return;
@@ -112,6 +120,7 @@ function createBridgeStreamResponse(
         if (closed) return;
         closed = true;
         stopKeepalive();
+        stopToolCallFlushTimer();
         controller.close();
       };
       const makeChunk = (
@@ -135,6 +144,64 @@ function createBridgeStreamResponse(
           choices: [],
           usage: { prompt_tokens, completion_tokens, total_tokens },
         };
+      };
+      const publishPendingToolCalls = () => {
+        if (closed || toolCallsFlushed || state.pendingExecs.length === 0) return;
+
+        toolCallsFlushed = true;
+        stopToolCallFlushTimer();
+
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning)
+          sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) {
+          assistantText += flushed.content;
+          sendSSE(makeChunk({ content: flushed.content }));
+        }
+
+        const toolCalls = state.pendingExecs.map((exec) => ({
+          index: state.toolCallIndex++,
+          id: exec.toolCallId,
+          type: "function" as const,
+          function: {
+            name: exec.toolName,
+            arguments: exec.decodedArgs,
+          },
+        }));
+        const assistantSeedText = [
+          assistantText.trim(),
+          toolCalls.map(formatToolCallSummary).join("\n\n"),
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+
+        sendSSE(makeChunk({ tool_calls: toolCalls }));
+
+        activeBridges.set(bridgeKey, {
+          bridge,
+          heartbeatTimer,
+          blobStore,
+          cloudRule,
+          mcpTools,
+          pendingExecs: [...state.pendingExecs],
+          modelId,
+          metadata: {
+            ...metadata,
+            assistantSeedText,
+          },
+        });
+
+        sendSSE(makeChunk({}, "tool_calls"));
+        sendDone();
+        closeController();
+      };
+      const schedulePendingToolCallPublish = () => {
+        if (toolCallsFlushed) return;
+        stopToolCallFlushTimer();
+        toolCallFlushTimer = setTimeout(
+          publishPendingToolCalls,
+          MCP_TOOL_BATCH_WINDOW_MS,
+        );
       };
 
       const processChunk = createConnectFrameParser(
@@ -176,61 +243,7 @@ function createBridgeStreamResponse(
                 }
                 mcpExecReceived = true;
 
-                const flushed = tagFilter.flush();
-                if (flushed.reasoning)
-                  sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-                if (flushed.content) {
-                  assistantText += flushed.content;
-                  sendSSE(makeChunk({ content: flushed.content }));
-                }
-
-                const assistantSeedText = [
-                  assistantText.trim(),
-                  formatToolCallSummary({
-                    id: exec.toolCallId,
-                    type: "function",
-                    function: {
-                      name: exec.toolName,
-                      arguments: exec.decodedArgs,
-                    },
-                  }),
-                ]
-                  .filter(Boolean)
-                  .join("\n\n");
-
-                sendSSE(
-                  makeChunk({
-                    tool_calls: [
-                      {
-                        index: state.toolCallIndex++,
-                        id: exec.toolCallId,
-                        type: "function",
-                        function: {
-                          name: exec.toolName,
-                          arguments: exec.decodedArgs,
-                        },
-                      },
-                    ],
-                  }),
-                );
-
-                activeBridges.set(bridgeKey, {
-                  bridge,
-                  heartbeatTimer,
-                  blobStore,
-                  cloudRule,
-                  mcpTools,
-                  pendingExecs: state.pendingExecs,
-                  modelId,
-                  metadata: {
-                    ...metadata,
-                    assistantSeedText,
-                  },
-                });
-
-                sendSSE(makeChunk({}, "tool_calls"));
-                sendDone();
-                closeController();
+                schedulePendingToolCallPublish();
               },
               (checkpointBytes) => {
                 updateConversationCheckpoint(convKey, checkpointBytes);
@@ -319,6 +332,7 @@ function createBridgeStreamResponse(
         bridgeCloseController.dispose();
         clearInterval(heartbeatTimer);
         stopKeepalive();
+        stopToolCallFlushTimer();
         syncStoredBlobStore(convKey, blobStore);
 
         if (endStreamError) {
@@ -357,6 +371,7 @@ function createBridgeStreamResponse(
     cancel(reason) {
       bridgeCloseController.dispose();
       stopKeepalive();
+      stopToolCallFlushTimer();
       clearInterval(heartbeatTimer);
       syncStoredBlobStore(convKey, blobStore);
       const active = activeBridges.get(bridgeKey);
@@ -464,6 +479,10 @@ export async function handleToolResultResume(
       .filter(Boolean)
       .join("\n\n"),
   };
+  const toolResultIds = new Set(toolResults.map((result) => result.toolCallId));
+  const matchedPendingExecs = pendingExecs.filter((exec) =>
+    toolResultIds.has(exec.toolCallId),
+  );
 
   logPluginInfo("Preparing Cursor tool-result resume", {
     bridgeKey,
@@ -500,7 +519,7 @@ export async function handleToolResultResume(
     );
   }
 
-  for (const exec of pendingExecs) {
+  for (const exec of matchedPendingExecs) {
     const result = toolResults.find(
       (toolResult) => toolResult.toolCallId === exec.toolCallId,
     );
