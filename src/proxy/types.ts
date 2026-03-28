@@ -22,6 +22,14 @@ export interface PendingExec {
   modelCallId?: string;
 }
 
+export interface ActiveBridgeDiagnostics {
+  announcedToolCallIds: string[];
+  publishedToolCallIds: string[];
+  lastMcpUpdate?: string;
+  publishedAtMs?: number;
+  lastResumeAttemptAtMs?: number;
+}
+
 /** A live Cursor session kept alive across requests for tool result continuation. */
 export interface ActiveBridge {
   bridge: CursorSession;
@@ -32,4 +40,5 @@ export interface ActiveBridge {
   pendingExecs: PendingExec[];
   modelId: string;
   metadata: ConversationRequestMetadata;
+  diagnostics?: ActiveBridgeDiagnostics;
 }

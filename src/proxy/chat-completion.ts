@@ -132,6 +132,7 @@ export function handleChatCompletion(
       activeBridgeModelId: activeBridge.modelId,
       toolResults,
       pendingExecs: activeBridge.pendingExecs,
+      diagnostics: activeBridge.diagnostics,
     });
     activeBridges.delete(bridgeKey);
 
