@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync } from "node:fs";
+import { cpSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -8,6 +8,8 @@ const rootDir = resolve(scriptDir, "..");
 const distDir = resolve(rootDir, "dist");
 const agentsSourcePath = resolve(rootDir, "AGENTS.md");
 const agentsDestPath = resolve(distDir, "AGENTS.md");
+
+rmSync(distDir, { recursive: true, force: true });
 
 const tsc = spawnSync("tsc", ["-p", "tsconfig.json"], {
   cwd: rootDir,

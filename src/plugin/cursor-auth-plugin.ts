@@ -1,4 +1,10 @@
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
+import type {
+  Hooks,
+  Plugin,
+  PluginInput,
+  PluginModule,
+  PluginOptions,
+} from "@opencode-ai/plugin";
 import {
   generateCursorAuthParams,
   getTokenExpiry,
@@ -22,9 +28,11 @@ import {
 import { startProxy, stopProxy } from "../proxy";
 
 let lastModelDiscoveryError: string | null = null;
+const PLUGIN_ID = "@playwo/opencode-cursor-oauth";
 
-export const CursorAuthPlugin: Plugin = async (
+export const server: Plugin = async (
   input: PluginInput,
+  _options?: PluginOptions,
 ): Promise<Hooks> => {
   configurePluginLogger(input);
 
@@ -158,6 +166,13 @@ export const CursorAuthPlugin: Plugin = async (
   };
 };
 
+export const CursorAuthPlugin = server;
+
+export const CursorAuthPluginModule: PluginModule = {
+  id: PLUGIN_ID,
+  server,
+};
+
 async function showDiscoveryFailureToast(
   input: PluginInput,
   message: string,
@@ -180,4 +195,4 @@ async function showDiscoveryFailureToast(
   }
 }
 
-export default CursorAuthPlugin;
+export default CursorAuthPluginModule;

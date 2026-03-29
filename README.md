@@ -16,9 +16,17 @@ This is an [OpenCode](https://opencode.ai) plugin that lets you use **Cursor clo
 
 There are **no extra runtime requirements** beyond what OpenCode already needs: you do not install Node, Python, or Docker separately for this plugin. Enable it in OpenCode’s config and complete login in the UI.
 
+This package targets the OpenCode `1.3.4+` plugin system and ships a dedicated server plugin entrypoint for modern OpenCode releases.
+
 ## Install
 
-Add the package to your OpenCode configuration (for example `opencode.json`):
+Install the plugin package with OpenCode:
+
+```bash
+opencode plugin @playwo/opencode-cursor-oauth
+```
+
+Or add the package to your OpenCode configuration manually (for example `opencode.json`):
 
 ```json
 {
@@ -26,7 +34,7 @@ Add the package to your OpenCode configuration (for example `opencode.json`):
 }
 ```
 
-Install or update dependencies the way you normally do for OpenCode plugins (e.g. ensure the package is available to your OpenCode environment). You need **OpenCode 1.2+** and a **Cursor account** with API/model access.
+OpenCode `1.3.4+` can discover this package as a server plugin automatically. You need **OpenCode 1.3.4+** and a **Cursor account** with API/model access.
 
 ## Connect auth and use it
 
