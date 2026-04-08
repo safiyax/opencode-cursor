@@ -24,7 +24,6 @@ import {
   buildDisabledProviderConfig,
   type ProviderWithModels,
   setProviderModels,
-  stripAuthorizationHeader,
 } from "../provider/models";
 import { startProxy, stopProxy } from "../proxy";
 
@@ -115,9 +114,6 @@ export const server: Plugin = async (
           return {
             baseURL: `http://localhost:${port}/v1`,
             apiKey: "cursor-proxy",
-            async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
-              return fetch(requestInput, stripAuthorizationHeader(init));
-            },
           };
         } catch (error) {
           const message =
