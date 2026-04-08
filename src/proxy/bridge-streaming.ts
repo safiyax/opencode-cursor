@@ -349,8 +349,8 @@ function createBridgeStreamResponse(
           pendingExecToolCallIds: sortedIds(state.pendingExecs.map((exec) => exec.toolCallId)),
         });
 
-        sendUsageChunkIfChanged();
         sendSSE(makeChunk({}, "tool_calls"));
+        sendUsageChunkIfChanged();
         sendDone();
         closeController();
       };
@@ -437,10 +437,10 @@ function createBridgeStreamResponse(
                   hasStoredActiveBridge: Boolean(existingActiveBridge),
                   storedActiveBridgePendingExecToolCallIds: existingActiveBridge
                     ? sortedIds(
-                        existingActiveBridge.pendingExecs.map(
-                          (candidate) => candidate.toolCallId,
-                        ),
-                      )
+                      existingActiveBridge.pendingExecs.map(
+                        (candidate) => candidate.toolCallId,
+                      ),
+                    )
                     : [],
                 });
               },
@@ -511,10 +511,10 @@ function createBridgeStreamResponse(
                   hasStoredActiveBridge: Boolean(existingActiveBridge),
                   storedActiveBridgePendingExecToolCallIds: existingActiveBridge
                     ? sortedIds(
-                        existingActiveBridge.pendingExecs.map(
-                          (candidate) => candidate.toolCallId,
-                        ),
-                      )
+                      existingActiveBridge.pendingExecs.map(
+                        (candidate) => candidate.toolCallId,
+                      ),
+                    )
                     : [],
                   storedActiveBridgeDiagnostics: existingActiveBridge?.diagnostics,
                 });
@@ -530,7 +530,6 @@ function createBridgeStreamResponse(
                   ),
                 });
                 updateConversationCheckpoint(convKey, checkpointBytes);
-                sendUsageChunkIfChanged();
                 bridgeController.noteCheckpoint();
                 if (state.pendingExecs.length > 0 && !toolCallsFlushed) {
                   publishPendingToolCalls("checkpoint");
@@ -888,31 +887,31 @@ export async function handleToolResultResume(
     );
     const mcpResult = result
       ? create(McpResultSchema, {
-          result: {
-            case: "success",
-            value: create(McpSuccessSchema, {
-              content: [
-                create(McpToolResultContentItemSchema, {
-                  content: {
-                    case: "text",
-                    value: create(McpTextContentSchema, {
-                      text: result.content,
-                    }),
-                  },
-                }),
-              ],
-              isError: false,
-            }),
-          },
-        })
+        result: {
+          case: "success",
+          value: create(McpSuccessSchema, {
+            content: [
+              create(McpToolResultContentItemSchema, {
+                content: {
+                  case: "text",
+                  value: create(McpTextContentSchema, {
+                    text: result.content,
+                  }),
+                },
+              }),
+            ],
+            isError: false,
+          }),
+        },
+      })
       : create(McpResultSchema, {
-          result: {
-            case: "error",
-            value: create(McpErrorSchema, {
-              error: "Tool result not provided",
-            }),
-          },
-        });
+        result: {
+          case: "error",
+          value: create(McpErrorSchema, {
+            error: "Tool result not provided",
+          }),
+        },
+      });
 
     const execClientMessage = create(ExecClientMessageSchema, {
       id: exec.execMsgId,
