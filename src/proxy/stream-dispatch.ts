@@ -7,43 +7,29 @@ import {
   ClientHeartbeatSchema,
   ConversationStateStructureSchema,
   BackgroundShellSpawnResultSchema,
-  CreatePlanErrorSchema,
   CreatePlanRequestResponseSchema,
-  CreatePlanResultSchema,
-  DeleteResultSchema,
-  DeleteRejectedSchema,
   DiagnosticsResultSchema,
+  ExecClientControlMessageSchema,
   ExecClientMessageSchema,
+  ExecClientStreamCloseSchema,
+  ExaFetchRequestResponse_ApprovedSchema,
   ExaFetchRequestResponseSchema,
-  ExaFetchRequestResponse_RejectedSchema,
+  ExaSearchRequestResponse_ApprovedSchema,
   ExaSearchRequestResponseSchema,
-  ExaSearchRequestResponse_RejectedSchema,
-  FetchErrorSchema,
-  FetchResultSchema,
   GetBlobResultSchema,
-  GrepErrorSchema,
-  GrepResultSchema,
   type InteractionQuery,
   InteractionResponseSchema,
   KvClientMessageSchema,
-  LsRejectedSchema,
-  LsResultSchema,
   McpInstructionsSchema,
   McpResultSchema,
-  ReadRejectedSchema,
-  ReadResultSchema,
   RequestContextResultSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
   SetBlobResultSchema,
   ShellRejectedSchema,
-  ShellResultSchema,
   SwitchModeRequestResponseSchema,
-  SwitchModeRequestResponse_RejectedSchema,
+  WebSearchRequestResponse_ApprovedSchema,
   WebSearchRequestResponseSchema,
-  WebSearchRequestResponse_RejectedSchema,
-  WriteRejectedSchema,
-  WriteResultSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
   type AgentServerMessage,
@@ -422,11 +408,8 @@ function handleInteractionQuery(
   if (queryCase === "webSearchRequestQuery") {
     const response = create(WebSearchRequestResponseSchema, {
       result: {
-        case: "rejected",
-        value: create(WebSearchRequestResponse_RejectedSchema, {
-          reason:
-            "Native Cursor web search is not available in this environment. Use the provided MCP tool `websearch` instead.",
-        }),
+        case: "approved",
+        value: create(WebSearchRequestResponse_ApprovedSchema, {}),
       },
     });
     sendInteractionResponse(
@@ -444,8 +427,7 @@ function handleInteractionQuery(
         result: {
           case: "rejected",
           value: create(AskQuestionRejectedSchema, {
-            reason:
-              "Native Cursor question prompts are not available in this environment. Use the provided MCP tool `question` instead.",
+            reason: "Non-interactive session",
           }),
         },
       }),
@@ -460,15 +442,7 @@ function handleInteractionQuery(
   }
 
   if (queryCase === "switchModeRequestQuery") {
-    const response = create(SwitchModeRequestResponseSchema, {
-      result: {
-        case: "rejected",
-        value: create(SwitchModeRequestResponse_RejectedSchema, {
-          reason:
-            "Cursor mode switching is not available in this environment. Continue using the current agent and the provided MCP tools.",
-        }),
-      },
-    });
+    const response = create(SwitchModeRequestResponseSchema, {});
     sendInteractionResponse(
       query.id,
       "switchModeRequestResponse",
@@ -481,11 +455,8 @@ function handleInteractionQuery(
   if (queryCase === "exaSearchRequestQuery") {
     const response = create(ExaSearchRequestResponseSchema, {
       result: {
-        case: "rejected",
-        value: create(ExaSearchRequestResponse_RejectedSchema, {
-          reason:
-            "Native Cursor Exa search is not available in this environment. Use the provided MCP tool `websearch` instead.",
-        }),
+        case: "approved",
+        value: create(ExaSearchRequestResponse_ApprovedSchema, {}),
       },
     });
     sendInteractionResponse(
@@ -500,11 +471,8 @@ function handleInteractionQuery(
   if (queryCase === "exaFetchRequestQuery") {
     const response = create(ExaFetchRequestResponseSchema, {
       result: {
-        case: "rejected",
-        value: create(ExaFetchRequestResponse_RejectedSchema, {
-          reason:
-            "Native Cursor Exa fetch is not available in this environment. Use the provided MCP tools `websearch` and `webfetch` instead.",
-        }),
+        case: "approved",
+        value: create(ExaFetchRequestResponse_ApprovedSchema, {}),
       },
     });
     sendInteractionResponse(
@@ -517,18 +485,7 @@ function handleInteractionQuery(
   }
 
   if (queryCase === "createPlanRequestQuery") {
-    const response = create(CreatePlanRequestResponseSchema, {
-      result: create(CreatePlanResultSchema, {
-        planUri: "",
-        result: {
-          case: "error",
-          value: create(CreatePlanErrorSchema, {
-            error:
-              "Native Cursor plan creation is not available in this environment. Use the provided MCP planning tools instead.",
-          }),
-        },
-      }),
-    });
+    const response = create(CreatePlanRequestResponseSchema, {});
     sendInteractionResponse(
       query.id,
       "createPlanRequestResponse",
@@ -538,10 +495,11 @@ function handleInteractionQuery(
     return;
   }
 
-  onUnsupportedMessage?.({
-    category: "interactionQuery",
-    caseName: queryCase ?? "undefined",
+  const response = create(InteractionResponseSchema, { id: query.id });
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "interactionResponse", value: response },
   });
+  sendFrame(toBinary(AgentClientMessageSchema, clientMessage));
 }
 
 /** Send a KV client response back to Cursor. */
@@ -688,127 +646,12 @@ function handleExecMessage(
     return;
   }
 
-  // --- Reject native Cursor tools ---
-  // The model tries these first. We must respond with rejection/error
-  // so it falls back to our MCP tools (registered via RequestContext).
+  // --- Handle remaining unsupported native tools ---
   const REJECT_REASON =
     "Tool not available in this environment. Use the MCP tools provided instead.";
 
-  if (execCase === "readArgs") {
-    logPluginInfo("Rejecting native Cursor read tool in favor of MCP", {
-      execId: execMsg.execId,
-      execMsgId: execMsg.id,
-      path: execMsg.message.value.path,
-    });
-    const args = execMsg.message.value;
-    const result = create(ReadResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(ReadRejectedSchema, {
-          path: args.path,
-          reason: REJECT_REASON,
-        }),
-      },
-    });
-    sendExecResult(execMsg, "readResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "lsArgs") {
-    logPluginInfo("Rejecting native Cursor ls tool in favor of MCP", {
-      execId: execMsg.execId,
-      execMsgId: execMsg.id,
-      path: execMsg.message.value.path,
-    });
-    const args = execMsg.message.value;
-    const result = create(LsResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(LsRejectedSchema, {
-          path: args.path,
-          reason: REJECT_REASON,
-        }),
-      },
-    });
-    sendExecResult(execMsg, "lsResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "grepArgs") {
-    logPluginInfo("Rejecting native Cursor grep tool in favor of MCP", {
-      execId: execMsg.execId,
-      execMsgId: execMsg.id,
-    });
-    const result = create(GrepResultSchema, {
-      result: {
-        case: "error",
-        value: create(GrepErrorSchema, { error: REJECT_REASON }),
-      },
-    });
-    sendExecResult(execMsg, "grepResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "writeArgs") {
-    logPluginInfo("Rejecting native Cursor write tool in favor of MCP", {
-      execId: execMsg.execId,
-      execMsgId: execMsg.id,
-      path: execMsg.message.value.path,
-    });
-    const args = execMsg.message.value;
-    const result = create(WriteResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(WriteRejectedSchema, {
-          path: args.path,
-          reason: REJECT_REASON,
-        }),
-      },
-    });
-    sendExecResult(execMsg, "writeResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "deleteArgs") {
-    logPluginInfo("Rejecting native Cursor delete tool in favor of MCP", {
-      execId: execMsg.execId,
-      execMsgId: execMsg.id,
-      path: execMsg.message.value.path,
-    });
-    const args = execMsg.message.value;
-    const result = create(DeleteResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(DeleteRejectedSchema, {
-          path: args.path,
-          reason: REJECT_REASON,
-        }),
-      },
-    });
-    sendExecResult(execMsg, "deleteResult", result, sendFrame);
-    return;
-  }
-  if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
-    logPluginInfo("Rejecting native Cursor shell tool in favor of MCP", {
-      execId: execMsg.execId,
-      execMsgId: execMsg.id,
-      command: execMsg.message.value.command ?? "",
-      workingDirectory: execMsg.message.value.workingDirectory ?? "",
-      execCase,
-    });
-    const args = execMsg.message.value;
-    const result = create(ShellResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(ShellRejectedSchema, {
-          command: args.command ?? "",
-          workingDirectory: args.workingDirectory ?? "",
-          reason: REJECT_REASON,
-          isReadonly: false,
-        }),
-      },
-    });
-    sendExecResult(execMsg, "shellResult", result, sendFrame);
-    return;
-  }
   if (execCase === "backgroundShellSpawnArgs") {
-    logPluginInfo("Rejecting native Cursor background shell tool in favor of MCP", {
+    logPluginInfo("Rejecting unsupported Cursor background shell tool", {
       execId: execMsg.execId,
       execMsgId: execMsg.id,
       command: execMsg.message.value.command ?? "",
@@ -830,7 +673,7 @@ function handleExecMessage(
     return;
   }
   if (execCase === "writeShellStdinArgs") {
-    logPluginInfo("Rejecting native Cursor shell stdin tool in favor of MCP", {
+    logPluginInfo("Rejecting unsupported Cursor shell stdin tool", {
       execId: execMsg.execId,
       execMsgId: execMsg.id,
     });
@@ -843,27 +686,8 @@ function handleExecMessage(
     sendExecResult(execMsg, "writeShellStdinResult", result, sendFrame);
     return;
   }
-  if (execCase === "fetchArgs") {
-    logPluginInfo("Rejecting native Cursor fetch tool in favor of MCP", {
-      execId: execMsg.execId,
-      execMsgId: execMsg.id,
-      url: execMsg.message.value.url,
-    });
-    const args = execMsg.message.value;
-    const result = create(FetchResultSchema, {
-      result: {
-        case: "error",
-        value: create(FetchErrorSchema, {
-          url: args.url ?? "",
-          error: REJECT_REASON,
-        }),
-      },
-    });
-    sendExecResult(execMsg, "fetchResult", result, sendFrame);
-    return;
-  }
   if (execCase === "diagnosticsArgs") {
-    logPluginInfo("Rejecting native Cursor diagnostics tool in favor of MCP", {
+    logPluginInfo("Responding to Cursor diagnostics exec", {
       execId: execMsg.execId,
       execMsgId: execMsg.id,
       path: execMsg.message.value.path,
@@ -892,11 +716,12 @@ function handleExecMessage(
     return;
   }
 
-  logPluginError("Unhandled Cursor exec type", {
+  logPluginWarn("Unhandled Cursor exec type, sending empty result", {
     execCase: execCase ?? "undefined",
     execId: execMsg.execId,
     execMsgId: execMsg.id,
   });
+  sendUnknownExecResult(execMsg, sendFrame);
   onUnhandledExec?.({
     execCase: execCase ?? "undefined",
     execId: execMsg.execId,
@@ -920,4 +745,47 @@ function sendExecResult(
     message: { case: "execClientMessage", value: execClientMessage },
   });
   sendFrame(toBinary(AgentClientMessageSchema, clientMessage));
+  sendExecStreamClose(execMsg.id, sendFrame);
+}
+
+function sendExecStreamClose(
+  execMsgId: number,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const controlMsg = create(ExecClientControlMessageSchema, {
+    message: {
+      case: "streamClose",
+      value: create(ExecClientStreamCloseSchema, { id: execMsgId }),
+    },
+  });
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "execClientControlMessage", value: controlMsg },
+  });
+  sendFrame(toBinary(AgentClientMessageSchema, clientMessage));
+}
+
+function sendUnknownExecResult(
+  execMsg: ExecServerMessage,
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  const unknownFields: Array<{ no: number; wireType: number; data: Uint8Array }> | undefined = (
+    execMsg as any
+  ).$unknown;
+  const argsField = unknownFields?.find(
+    (field) => field.wireType === 2 && field.no !== 1 && field.no !== 15 && field.no !== 19,
+  );
+  if (!argsField) return;
+
+  const execClientMessage = create(ExecClientMessageSchema, {
+    id: execMsg.id,
+    execId: execMsg.execId,
+  });
+  (execClientMessage as any).$unknown = [
+    { no: argsField.no, wireType: 2, data: new Uint8Array(0) },
+  ];
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "execClientMessage", value: execClientMessage },
+  });
+  sendFrame(toBinary(AgentClientMessageSchema, clientMessage));
+  sendExecStreamClose(execMsg.id, sendFrame);
 }
