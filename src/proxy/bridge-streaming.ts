@@ -1,13 +1,6 @@
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { fromBinary } from "@bufbuild/protobuf";
 import {
-  AgentClientMessageSchema,
   AgentServerMessageSchema,
-  ExecClientMessageSchema,
-  McpErrorSchema,
-  McpResultSchema,
-  McpSuccessSchema,
-  McpTextContentSchema,
-  McpToolResultContentItemSchema,
   type McpToolDefinition,
 } from "../proto/agent_pb";
 import type { CursorSession } from "../cursor/bidi-session";
@@ -34,6 +27,7 @@ import {
 } from "./state-sync";
 import { SSE_HEADERS } from "./sse";
 import type { StreamState } from "./stream-state";
+import { sendPendingExecResult } from "./native-tools";
 import type { ActiveBridge, CursorRequestPayload } from "./types";
 import {
   computeUsage,
@@ -885,45 +879,6 @@ export async function handleToolResultResume(
     const result = toolResults.find(
       (toolResult) => toolResult.toolCallId === exec.toolCallId,
     );
-    const mcpResult = result
-      ? create(McpResultSchema, {
-        result: {
-          case: "success",
-          value: create(McpSuccessSchema, {
-            content: [
-              create(McpToolResultContentItemSchema, {
-                content: {
-                  case: "text",
-                  value: create(McpTextContentSchema, {
-                    text: result.content,
-                  }),
-                },
-              }),
-            ],
-            isError: false,
-          }),
-        },
-      })
-      : create(McpResultSchema, {
-        result: {
-          case: "error",
-          value: create(McpErrorSchema, {
-            error: "Tool result not provided",
-          }),
-        },
-      });
-
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: exec.execMsgId,
-      execId: exec.execId,
-      message: {
-        case: "mcpResult" as const,
-        value: mcpResult,
-      },
-    });
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage },
-    });
 
     logPluginInfo("Sending Cursor tool-result resume message", {
       bridgeKey,
@@ -939,7 +894,7 @@ export async function handleToolResultResume(
       matchedToolResult: result,
     });
 
-    bridge.write(toBinary(AgentClientMessageSchema, clientMessage));
+    sendPendingExecResult(bridge, exec, result?.content);
   }
 
   return createBridgeStreamResponse(

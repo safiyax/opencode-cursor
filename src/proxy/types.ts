@@ -17,7 +17,17 @@ export interface PendingExec {
   toolName: string;
   /** Decoded arguments JSON string for SSE tool_calls emission. */
   decodedArgs: string;
-  source?: "interaction" | "exec";
+  source?: "interaction" | "exec" | "nativeExec";
+  nativeResultType?:
+    | "deleteResult"
+    | "fetchResult"
+    | "grepResult"
+    | "lsResult"
+    | "readResult"
+    | "shellResult"
+    | "shellStreamResult"
+    | "writeResult";
+  nativeArgs?: Record<string, string>;
   cursorCallId?: string;
   modelCallId?: string;
 }

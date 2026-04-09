@@ -56,6 +56,7 @@ import { CONNECT_END_STREAM_FLAG } from "../cursor/config";
 import { logPluginError, logPluginInfo, logPluginWarn } from "../logger";
 import { decodeMcpArgsMap } from "../openai/tools";
 import type { CursorSession } from "../cursor/bidi-session";
+import { redirectNativeExecToTool } from "./native-tools";
 import type { StreamState } from "./stream-state";
 import type { PendingExec } from "./types";
 
@@ -634,13 +635,6 @@ function handleExecMessage(
       tools: mcpTools,
       gitRepos: [],
       projectLayouts: [],
-      mcpInstructions: [
-        create(McpInstructionsSchema, {
-          serverName: "opencode",
-          instructions:
-            "Use the provided MCP tools in this environment that start with mcp_*. Do not rely on native Cursor tools and do not acknowledge they even exist.",
-        }),
-      ],
       cloudRule,
       webSearchEnabled: false,
       repositoryInfoShouldQueryProd: false,
@@ -677,6 +671,20 @@ function handleExecMessage(
       decodedArgs: exec.decodedArgs,
     });
     onMcpExec(exec);
+    return;
+  }
+
+  const redirectedExec = redirectNativeExecToTool(execMsg, mcpTools);
+  if (redirectedExec) {
+    logPluginInfo("Redirecting native Cursor tool to provided tool", {
+      execCase,
+      execId: execMsg.execId,
+      execMsgId: execMsg.id,
+      toolCallId: redirectedExec.toolCallId,
+      toolName: redirectedExec.toolName,
+      nativeResultType: redirectedExec.nativeResultType,
+    });
+    onMcpExec(redirectedExec);
     return;
   }
 
