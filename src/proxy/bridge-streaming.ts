@@ -6,8 +6,8 @@ import {
 import type { CursorSession } from "../cursor/bidi-session";
 import {
   errorDetails,
+  logPluginDebug,
   logPluginError,
-  logPluginInfo,
   logPluginWarn,
 } from "../logger";
 import {
@@ -204,7 +204,7 @@ function createBridgeStreamResponse(
         if (toolCall.started) return;
 
         toolCall.started = true;
-        logPluginInfo("Streaming pending Cursor tool-call start", {
+        logPluginDebug("Streaming pending Cursor tool-call start", {
           modelId,
           bridgeKey,
           convKey,
@@ -244,7 +244,7 @@ function createBridgeStreamResponse(
           return;
         }
 
-        logPluginInfo("Evaluating Cursor tool-call publish", {
+        logPluginDebug("Evaluating Cursor tool-call publish", {
           modelId,
           bridgeKey,
           convKey,
@@ -305,7 +305,7 @@ function createBridgeStreamResponse(
           },
         });
 
-        logPluginInfo("Publishing Cursor tool-call envelope", {
+        logPluginDebug("Publishing Cursor tool-call envelope", {
           modelId,
           bridgeKey,
           convKey,
@@ -335,7 +335,7 @@ function createBridgeStreamResponse(
           );
         }
 
-        logPluginInfo("Stored active Cursor bridge for tool-result resume", {
+        logPluginDebug("Stored active Cursor bridge for tool-result resume", {
           modelId,
           bridgeKey,
           convKey,
@@ -420,7 +420,7 @@ function createBridgeStreamResponse(
                       existingActiveBridge.diagnostics?.lastResumeAttemptAtMs,
                   };
                 }
-                logPluginInfo("Tracking Cursor MCP exec in streaming bridge", {
+                logPluginDebug("Tracking Cursor MCP exec in streaming bridge", {
                   modelId,
                   bridgeKey,
                   convKey,
@@ -489,7 +489,7 @@ function createBridgeStreamResponse(
                       existingActiveBridge.diagnostics?.lastResumeAttemptAtMs,
                   };
                 }
-                logPluginInfo("Tracking Cursor step boundary in streaming bridge", {
+                logPluginDebug("Tracking Cursor step boundary in streaming bridge", {
                   modelId,
                   bridgeKey,
                   convKey,
@@ -514,7 +514,7 @@ function createBridgeStreamResponse(
                 });
               },
               (checkpointBytes) => {
-                logPluginInfo("Received Cursor conversation checkpoint", {
+                logPluginDebug("Received Cursor conversation checkpoint", {
                   modelId,
                   bridgeKey,
                   convKey,
@@ -530,7 +530,7 @@ function createBridgeStreamResponse(
                 }
               },
               () => {
-                logPluginInfo("Received Cursor turn-ended signal", {
+                logPluginDebug("Received Cursor turn-ended signal", {
                   modelId,
                   bridgeKey,
                   convKey,
@@ -582,7 +582,7 @@ function createBridgeStreamResponse(
           }
         },
         (endStreamBytes) => {
-          logPluginInfo("Received Cursor end-of-stream signal", {
+          logPluginDebug("Received Cursor end-of-stream signal", {
             modelId,
             bridgeKey,
             convKey,
@@ -622,7 +622,7 @@ function createBridgeStreamResponse(
         }
       }, SSE_KEEPALIVE_INTERVAL_MS);
 
-      logPluginInfo("Opened Cursor streaming bridge", {
+      logPluginDebug("Opened Cursor streaming bridge", {
         modelId,
         bridgeKey,
         convKey,
@@ -632,7 +632,7 @@ function createBridgeStreamResponse(
 
       bridge.onData(processChunk);
       bridge.onClose((code) => {
-        logPluginInfo("Cursor streaming bridge closed", {
+        logPluginDebug("Cursor streaming bridge closed", {
           modelId,
           bridgeKey,
           convKey,
@@ -712,7 +712,7 @@ export async function handleStreamingResponse(
   convKey: string,
   metadata: ConversationRequestMetadata,
 ): Promise<Response> {
-  logPluginInfo("Starting Cursor streaming response", {
+  logPluginDebug("Starting Cursor streaming response", {
     modelId,
     bridgeKey,
     convKey,
@@ -804,7 +804,7 @@ export async function handleToolResultResume(
     toolResultIds.has(exec.toolCallId),
   );
 
-  logPluginInfo("Preparing Cursor tool-result resume", {
+  logPluginDebug("Preparing Cursor tool-result resume", {
     bridgeKey,
     convKey,
     modelId,
@@ -820,7 +820,7 @@ export async function handleToolResultResume(
 
   const unresolved = await waitForResolvablePendingExecs(active, toolResults);
 
-  logPluginInfo("Resolved pending exec state before Cursor tool-result resume", {
+  logPluginDebug("Resolved pending exec state before Cursor tool-result resume", {
     bridgeKey,
     convKey,
     modelId,
@@ -880,7 +880,7 @@ export async function handleToolResultResume(
       (toolResult) => toolResult.toolCallId === exec.toolCallId,
     );
 
-    logPluginInfo("Sending Cursor tool-result resume message", {
+    logPluginDebug("Sending Cursor tool-result resume message", {
       bridgeKey,
       convKey,
       modelId,

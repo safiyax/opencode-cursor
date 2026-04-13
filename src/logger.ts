@@ -15,6 +15,8 @@ let currentLogger:
   | undefined;
 let pendingLogWrites: Promise<void> = Promise.resolve();
 
+const CONSOLE_FALLBACK_LEVELS = new Set<LogLevel>(["warn", "error"]);
+
 export function configurePluginLogger(input: PluginInput): void {
   currentLogger = {
     client: input.client,
@@ -45,6 +47,13 @@ export function logPluginWarn(
   logPlugin("warn", message, extra);
 }
 
+export function logPluginDebug(
+  message: string,
+  extra: Record<string, unknown> = {},
+): void {
+  logPlugin("debug", message, extra);
+}
+
 export function logPluginInfo(
   message: string,
   extra: Record<string, unknown> = {},
@@ -71,7 +80,9 @@ function logPlugin(
   const serializedExtra = serializeValue(extra, 0) as Record<string, unknown>;
 
   if (!currentLogger?.client?.app?.log) {
-    writeConsoleLog(level, message, serializedExtra);
+    if (shouldWriteConsoleFallback(level)) {
+      writeConsoleLog(level, message, serializedExtra);
+    }
     return;
   }
 
@@ -89,13 +100,19 @@ function logPlugin(
           },
         });
       } catch (logError) {
-        writeConsoleLog("warn", "Failed to forward plugin log to OpenCode", {
-          originalLevel: level,
-          originalMessage: message,
-          ...errorDetails(logError),
-        });
+        if (shouldWriteConsoleFallback(level)) {
+          writeConsoleLog("warn", "Failed to forward plugin log to OpenCode", {
+            originalLevel: level,
+            originalMessage: message,
+            ...errorDetails(logError),
+          });
+        }
       }
     });
+}
+
+function shouldWriteConsoleFallback(level: LogLevel): boolean {
+  return CONSOLE_FALLBACK_LEVELS.has(level);
 }
 
 function writeConsoleLog(

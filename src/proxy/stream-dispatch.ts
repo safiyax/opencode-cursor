@@ -39,7 +39,7 @@ import {
   type McpToolDefinition,
 } from "../proto/agent_pb";
 import { CONNECT_END_STREAM_FLAG } from "../cursor/config";
-import { logPluginError, logPluginInfo, logPluginWarn } from "../logger";
+import { logPluginDebug, logPluginError, logPluginWarn } from "../logger";
 import { decodeMcpArgsMap } from "../openai/tools";
 import type { CursorSession } from "../cursor/bidi-session";
 import { redirectNativeExecToTool } from "./native-tools";
@@ -235,7 +235,7 @@ export function processServerMessage(
 ): void {
   const msgCase = msg.message.case;
 
-  logPluginInfo("Received Cursor server signal", {
+  logPluginDebug("Received Cursor server signal", {
     messageCase: msgCase ?? "undefined",
     interactionCase:
       msgCase === "interactionUpdate"
@@ -363,7 +363,7 @@ function handleInteractionUpdate(
   } else if (updateCase === "toolCallCompleted") {
     const toolValue = update.message.value;
     if (toolValue?.toolCall?.tool?.case === "mcpToolCall") {
-      logPluginInfo("Ignoring Cursor interaction MCP tool completion", {
+      logPluginDebug("Ignoring Cursor interaction MCP tool completion", {
         callId: toolValue.callId,
         modelCallId: toolValue.modelCallId,
         toolCallId:
@@ -582,7 +582,7 @@ function handleExecMessage(
   const execCase = execMsg.message.case;
 
   if (execCase === "requestContextArgs") {
-    logPluginInfo("Responding to Cursor requestContextArgs", {
+    logPluginDebug("Responding to Cursor requestContextArgs", {
       execId: execMsg.execId,
       execMsgId: execMsg.id,
       mcpToolCount: mcpTools.length,
@@ -620,7 +620,7 @@ function handleExecMessage(
       decodedArgs: JSON.stringify(decoded),
       source: "exec" as const,
     };
-    logPluginInfo("Received Cursor exec MCP tool metadata", {
+    logPluginDebug("Received Cursor exec MCP tool metadata", {
       toolCallId: exec.toolCallId,
       toolName: exec.toolName,
       source: exec.source,
@@ -634,7 +634,7 @@ function handleExecMessage(
 
   const redirectedExec = redirectNativeExecToTool(execMsg, mcpTools);
   if (redirectedExec) {
-    logPluginInfo("Redirecting native Cursor tool to provided tool", {
+    logPluginDebug("Redirecting native Cursor tool to provided tool", {
       execCase,
       execId: execMsg.execId,
       execMsgId: execMsg.id,
@@ -651,7 +651,7 @@ function handleExecMessage(
     "Tool not available in this environment. Use the MCP tools provided instead.";
 
   if (execCase === "backgroundShellSpawnArgs") {
-    logPluginInfo("Rejecting unsupported Cursor background shell tool", {
+    logPluginDebug("Rejecting unsupported Cursor background shell tool", {
       execId: execMsg.execId,
       execMsgId: execMsg.id,
       command: execMsg.message.value.command ?? "",
@@ -673,7 +673,7 @@ function handleExecMessage(
     return;
   }
   if (execCase === "writeShellStdinArgs") {
-    logPluginInfo("Rejecting unsupported Cursor shell stdin tool", {
+    logPluginDebug("Rejecting unsupported Cursor shell stdin tool", {
       execId: execMsg.execId,
       execMsgId: execMsg.id,
     });
@@ -687,7 +687,7 @@ function handleExecMessage(
     return;
   }
   if (execCase === "diagnosticsArgs") {
-    logPluginInfo("Responding to Cursor diagnostics exec", {
+    logPluginDebug("Responding to Cursor diagnostics exec", {
       execId: execMsg.execId,
       execMsgId: execMsg.id,
       path: execMsg.message.value.path,
@@ -706,7 +706,7 @@ function handleExecMessage(
   };
   const resultCase = miscCaseMap[execCase as string];
   if (resultCase) {
-    logPluginInfo("Responding to miscellaneous Cursor exec message", {
+    logPluginDebug("Responding to miscellaneous Cursor exec message", {
       execCase,
       execId: execMsg.execId,
       execMsgId: execMsg.id,

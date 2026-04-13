@@ -1,4 +1,4 @@
-import { logPluginInfo, logPluginWarn } from "../logger";
+import { logPluginDebug, logPluginWarn } from "../logger";
 import {
   buildInitialHandoffPrompt,
   buildTitleSourceText,
@@ -46,7 +46,7 @@ export function handleChatCompletion(
   } = parsed;
   const modelId = body.model;
   const normalizedAgentKey = normalizeAgentKey(context.agentKey);
-  logPluginInfo("Handling Cursor chat completion request", {
+  logPluginDebug("Handling Cursor chat completion request", {
     modelId,
     stream: body.stream !== false,
     messageCount: body.messages.length,
@@ -115,7 +115,7 @@ export function handleChatCompletion(
     context.agentKey,
   );
   const activeBridge = activeBridges.get(bridgeKey);
-  logPluginInfo("Resolved Cursor conversation keys", {
+  logPluginDebug("Resolved Cursor conversation keys", {
     modelId,
     bridgeKey,
     convKey,
@@ -125,7 +125,7 @@ export function handleChatCompletion(
   });
 
   if (activeBridge && toolResults.length > 0) {
-    logPluginInfo("Matched OpenAI tool results to active Cursor bridge", {
+    logPluginDebug("Matched OpenAI tool results to active Cursor bridge", {
       bridgeKey,
       convKey,
       requestedModelId: modelId,
@@ -219,7 +219,7 @@ export function handleChatCompletion(
     stored.blobStore,
   );
   payload.mcpTools = mcpTools;
-  logPluginInfo("Built Cursor run request payload", {
+  logPluginDebug("Built Cursor run request payload", {
     modelId,
     bridgeKey,
     convKey,
